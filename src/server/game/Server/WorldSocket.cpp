@@ -796,14 +796,6 @@ void WorldSocket::TryCompleteRedirectAuth()
         return;
     }
 
-    // Client gave up while we were parked: do not consume its token for a dead socket.
-    if (!IsOpen())
-    {
-        _redirectAwaitingToken = false;
-        _redirectAccount.reset();
-        return;
-    }
-
     AccountInfo const& account = *_redirectAccount;
 
     // Consume the pending redirect for this account. The entry is bound to the
