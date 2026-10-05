@@ -11,7 +11,7 @@ MODE="${1:-all}"
 
 sync() {
   rsync -az --delete \
-    --exclude '.git/' --exclude 'build/' --exclude '*.o' \
+    --exclude 'build/' --exclude '*.o' \
     "$LOCAL_SRC/" "$VM:$REMOTE_SRC/"
 }
 configure() {
