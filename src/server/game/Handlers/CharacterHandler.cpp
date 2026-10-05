@@ -23,6 +23,7 @@
 #include "Chat.h"
 #include "ClientRedirect.h"
 #include "ClusterMgr.h"
+#include "GameClient.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "EquipmentSetPackets.h"
@@ -1154,6 +1155,14 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     pCurrChar->SendInitialPacketsAfterAddToMap();
     if (hadNatsTransfer && !wasTeleportedFar)
         pCurrChar->SetSemaphoreTeleportFar(false);
+
+    // Cluster: TC records the client's active mover only from CMSG_SET_ACTIVE_MOVER, which
+    // the 3.3.5 client sends on a fresh world entry but not after a seamless zone handoff
+    // (it never saw a new world). Until then every movement packet is rejected as
+    // "not allowed mover ... expected None". Set it server-side for redirect arrivals; a
+    // later CMSG_SET_ACTIVE_MOVER from the client just re-sets the same unit.
+    if (GetRedirectAutoLoginGuid() != 0)
+        GetGameClient()->SetActivelyMovedUnit(pCurrChar);
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
     stmt->setUInt8(0, sClusterMgr.GetNodeId());
