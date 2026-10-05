@@ -828,7 +828,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     pCurrChar->SendInitialPacketsAfterAddToMap();
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
-    stmt->setUInt32(0, pCurrChar->GetGUID().GetCounter());
+    stmt->setUInt8(0, 0); // owning node id; Task 8 replaces the 0 with sClusterMgr.GetNodeId()
+    stmt->setUInt32(1, pCurrChar->GetGUID().GetCounter());
     CharacterDatabase.Execute(stmt);
 
     LoginDatabasePreparedStatement* loginStmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_ONLINE);
