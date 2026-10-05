@@ -20,6 +20,7 @@
 - Commit message trailer: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - TC and AC worldservers must never be on the NATS bus at the same time. AC services (`~/335`) on both VMs stay stopped during all TC work.
 - Node MTU on routed VLANs stays 1500.
+- Build verdicts come from the `EXIT=` line in `build.log`, never from the script's exit status (its `build` mode always exits 0). Full rebuilds can exceed the tool timeout: run `make` under `nohup` on the VM and poll `tail -1 build.log` instead of holding an SSH session open. The unit-test binary is `build/bin/RelWithDebInfo/bin/tests`.
 
 ---
 
@@ -143,7 +144,7 @@ Expected: `errors: 0`, `EXIT=0`, install line ends normally. Takes 30–60 min o
 - [ ] **Step 7: Run TC's own unit tests on the VM as a second baseline**
 
 ```bash
-ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./tests/tests 2>&1 | tail -3'
+ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./bin/RelWithDebInfo/bin/tests 2>&1 | tail -3'
 ```
 Expected: `All tests passed`.
 
@@ -325,7 +326,7 @@ If the replay section fails because `Open` keys replay detection on something ot
 The implementation was copied in Step 1, so this run should pass on the first try; the test is the regression gate for every later edit to these files (and proves `shared` links OpenSSL transitively). Run:
 
 ```bash
-contrib/cluster/vm-sync-build.sh build && ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./tests/tests "[ClusterAuth]" 2>&1 | tail -3'
+contrib/cluster/vm-sync-build.sh build && ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./bin/RelWithDebInfo/bin/tests "[ClusterAuth]" 2>&1 | tail -3'
 ```
 Expected: `errors: 0` and `All tests passed`. If `tests` links `shared` but `Cluster/` symbols are missing, confirm `tests/CMakeLists.txt` links `shared` (it links `game` which pulls `shared`).
 
@@ -560,7 +561,7 @@ CooldownStorageType const& GetCooldowns() const { return _spellCooldowns; }
 - [ ] **Step 9: Build and run tests**
 
 ```bash
-contrib/cluster/vm-sync-build.sh build && ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./tests/tests 2>&1 | tail -1'
+contrib/cluster/vm-sync-build.sh build && ssh wow@192.0.2.10.20 'cd ~/source/c9core-tc/build && ./bin/RelWithDebInfo/bin/tests 2>&1 | tail -1'
 ```
 Expected: `errors: 0`, `All tests passed`.
 
