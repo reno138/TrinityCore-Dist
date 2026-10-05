@@ -178,11 +178,16 @@ PlayerTransferData SnapshotPlayer(Player const* player)
 // SnapshotPlayerFull — capture FULL state (v2) into PlayerTransferData
 // ---------------------------------------------------------------------------
 
-PlayerTransferData SnapshotPlayerFull(Player const* player)
+PlayerTransferData SnapshotPlayerFull(Player const* player, TransferTransportInfo const* transportOverride)
 {
     PlayerTransferData d = SnapshotPlayer(player);
     if (!player)
         return d;
+
+    // Caller-captured transport state (the cross-node teleport detaches the
+    // player before this runs, which zeroes the live offsets).
+    if (transportOverride)
+        d.transport = *transportOverride;
 
     d.activeSpec = player->GetActiveTalentGroup();
 

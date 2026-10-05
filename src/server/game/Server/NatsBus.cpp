@@ -2070,7 +2070,8 @@ void NatsBus::BroadcastPlayerTransferFull(Player const* player)
 
 void NatsBus::SendPlayerTransferForRedirect(Player const* player,
                                                  uint8 destNodeId,
-                                                 WorldLocation const& destLoc)
+                                                 WorldLocation const& destLoc,
+                                                 TransferTransportInfo const* transportOverride)
 {
     if (!_nc || !_connected || !player) return;
 
@@ -2078,7 +2079,7 @@ void NatsBus::SendPlayerTransferForRedirect(Player const* player,
     // cooldowns, quests, spells, equipment, pet, transport, vitals, etc.).
     // The snapshot captures the SOURCE position because the player hasn't
     // physically moved yet.
-    PlayerTransferData td = SnapshotPlayerFull(player);
+    PlayerTransferData td = SnapshotPlayerFull(player, transportOverride);
 
     // Override position/map with the teleport DESTINATION so the receiving
     // node spawns the player at the correct coordinates, not the stale

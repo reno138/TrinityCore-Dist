@@ -2026,7 +2026,14 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                 uint32 const token = destNode ? ClientRedirect::GenerateToken() : 0;
                 {
                     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                    // Cluster: spell-cast teleports re-enter here with the far semaphore already up (TC delayed
+                    // teleport), which makes SaveToDB a no-op. The destination loads this row, so force the save.
+                    bool const farSemaphoreWasSet = IsBeingTeleportedFar();
+                    if (farSemaphoreWasSet)
+                        SetSemaphoreTeleportFar(false);
                     SaveToDB(trans, false);
+                    if (farSemaphoreWasSet)
+                        SetSemaphoreTeleportFar(true);
 
                     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHARACTER_POSITION);
                     stmt->setFloat(0, m_teleport_dest.GetPositionX());
@@ -2047,8 +2054,19 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                         std::string const remoteAddress = GetSession()->GetRemoteAddress();
                         auto const addons = ClusterAddonsFromSession(GetSession()->GetSecureAddons());
                         uint32 const saveDispatchMs = getMSTime();
+                        // Cluster: snapshot runs in the commit callback, after the synchronous detach below zeroes the movement-info transport fields; capture them now.
+                        TransferTransportInfo capturedTransport{};
+                        if (Transport* transport = GetTransport())
+                        {
+                            capturedTransport.onTransport = true;
+                            capturedTransport.entry = transport->GetEntry();
+                            capturedTransport.offsetX = GetTransOffsetX();
+                            capturedTransport.offsetY = GetTransOffsetY();
+                            capturedTransport.offsetZ = GetTransOffsetZ();
+                            capturedTransport.offsetO = GetTransOffsetO();
+                        }
                         GetSession()->AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(trans))
-                            .AfterComplete([guid, dest, destLoc, token, accountId, remoteAddress, addons, saveDispatchMs](bool success)
+                            .AfterComplete([guid, dest, destLoc, token, accountId, remoteAddress, addons, saveDispatchMs, capturedTransport](bool success)
                         {
                             TC_LOG_INFO("server.worldserver", "Cluster handoff: save commit for {} took {} ms (success={})",
                                         guid.ToString(), GetMSTimeDiffToNow(saveDispatchMs), success);
@@ -2071,7 +2089,7 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                             // NATS delivers them in order, and the destination's
                             // WorldSocket admits the session as soon as the token is
                             // present.
-                            sNatsBus.SendPlayerTransferForRedirect(player, dest.nodeId, destLoc);
+                            sNatsBus.SendPlayerTransferForRedirect(player, dest.nodeId, destLoc, &capturedTransport);
                             sNatsBus.PublishRedirectToken(accountId, guid.GetRawValue(), token,
                                                           dest.nodeId, remoteAddress, addons);
                         });

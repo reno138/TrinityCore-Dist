@@ -184,7 +184,7 @@ struct PlayerTransferData
 PlayerTransferData SnapshotPlayer(Player const* player);
 
 /// Build a full PlayerTransferData (v2) with equipment, spells, talents, quests, etc.
-PlayerTransferData SnapshotPlayerFull(Player const* player);
+PlayerTransferData SnapshotPlayerFull(Player const* player, TransferTransportInfo const* transportOverride = nullptr);
 
 /// Serialize a PlayerTransferData to a binary byte buffer suitable for NATS publish.
 /// Wire format: little‑endian, length‑prefixed strings, "PT" magic + version header.

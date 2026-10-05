@@ -270,7 +270,8 @@ public:
     /// for direct SMSG_CONNECT_TO map-to-map teleports with no proxy.
     void SendPlayerTransferForRedirect(Player const* player,
                                         uint8 destNodeId,
-                                        WorldLocation const& destLoc);
+                                        WorldLocation const& destLoc,
+                                        TransferTransportInfo const* transportOverride = nullptr);
 
     /// Publish redirect token to the destination node ONLY (never broadcast —
     /// every node holding the token widens the window in which a stray
