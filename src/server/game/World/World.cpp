@@ -2524,16 +2524,21 @@ void World::Update(uint32 diff)
                 Map* map = player->FindMap();
                 // TC: CleanupsBeforeDelete is mandatory before a Player is deleted (trade/duel/transport back-pointers)
                 player->CleanupsBeforeDelete();
-                if (WorldSession* session = player->GetSession())
-                    session->SetPlayer(nullptr);
                 // Do NOT close the socket here. The client may still need the
                 // old connection alive while it transitions to the new node.
                 // The client will close it when ready, or the session will
                 // time out naturally.
+                // TC: delete the Player FIRST and clear the session pointer AFTER, exactly as
+                // WorldSession::LogoutPlayer does. ~Unit asserts that a unit still owned by a
+                // GameClient is destroyed while that client's base player is still this unit;
+                // SetPlayer(nullptr) before the delete trips it (crashed node 2, 2026-10-05).
+                WorldSession* session = player->GetSession();
                 if (map)
                     map->RemovePlayerFromMap(player, true);
                 else
                     delete player;
+                if (session)
+                    session->SetPlayer(nullptr); //! Pointer already deleted above
             }
         }
     }
