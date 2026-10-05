@@ -596,6 +596,13 @@ void InstanceSaveManager::_ResetInstance(uint32 mapid, uint32 instanceId)
 {
     TC_LOG_DEBUG("maps", "InstanceSaveMgr::_ResetInstance {}, {}", mapid, instanceId);
     Map const* map = sMapMgr->CreateBaseMap(mapid);
+    if (!map)
+    {
+        // nullptr on a cluster node that does not own this map; the owning node performs the reset
+        TC_LOG_DEBUG("maps.cluster", "InstanceSaveMgr::_ResetInstance: instance reset skipped for map {} not owned by this node", mapid);
+        return;
+    }
+
     if (!map->Instanceable())
         return;
 
@@ -688,6 +695,13 @@ void InstanceSaveManager::_ResetOrWarnAll(uint32 mapid, Difficulty difficulty, b
 
     // note: this isn't fast but it's meant to be executed very rarely
     Map* baseMap = sMapMgr->CreateBaseMap(mapid);            // _not_ include difficulty
+    if (!baseMap)
+    {
+        // nullptr on a cluster node that does not own this map; the owning node resets/warns its loaded instances
+        TC_LOG_DEBUG("maps.cluster", "InstanceSaveMgr::_ResetOrWarnAll: instance reset skipped for map {} not owned by this node", mapid);
+        return;
+    }
+
     uint32 timeLeft;
 
     for (auto& [_, map] : baseMap->ToMapInstanced()->GetInstancedMaps())

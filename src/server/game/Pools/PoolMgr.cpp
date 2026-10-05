@@ -162,6 +162,8 @@ void PoolGroup<Creature>::Despawn1Object(ObjectGuid::LowType guid, bool alwaysDe
         sObjectMgr->RemoveCreatureFromGrid(guid, data);
 
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         if (!map->Instanceable())
         {
             auto creatureBounds = map->GetCreatureBySpawnIdStore().equal_range(guid);
@@ -190,6 +192,8 @@ void PoolGroup<GameObject>::Despawn1Object(ObjectGuid::LowType guid, bool always
         sObjectMgr->RemoveGameobjectFromGrid(guid, data);
 
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         if (!map->Instanceable())
         {
             auto gameobjectBounds = map->GetGameObjectBySpawnIdStore().equal_range(guid);
@@ -317,6 +321,8 @@ void PoolGroup<Creature>::Spawn1Object(PoolObject* obj)
 
         // Spawn if necessary (loaded grids only)
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         // We use spawn coords to spawn
         if (!map->Instanceable() && map->IsGridLoaded(data->spawnPoint))
         {
@@ -341,6 +347,8 @@ void PoolGroup<GameObject>::Spawn1Object(PoolObject* obj)
         // Spawn if necessary (loaded grids only)
         // this base map checked as non-instanced and then only existed
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         // We use current coords to unspawn, not spawn coords since creature can have changed grid
         if (!map->Instanceable() && map->IsGridLoaded(data->spawnPoint))
         {
@@ -373,6 +381,8 @@ void PoolGroup<Creature>::RemoveRespawnTimeFromDB(ObjectGuid::LowType guid)
     if (CreatureData const* data = sObjectMgr->GetCreatureData(guid))
     {
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         if (!map->Instanceable())
         {
             map->RemoveRespawnTime(SPAWN_TYPE_CREATURE, guid, nullptr, true);
@@ -386,6 +396,8 @@ void PoolGroup<GameObject>::RemoveRespawnTimeFromDB(ObjectGuid::LowType guid)
     if (GameObjectData const* data = sObjectMgr->GetGameObjectData(guid))
     {
         Map* map = sMapMgr->CreateBaseMap(data->mapId);
+        if (!map)   // nullptr on a cluster node that does not own this map
+            return;
         if (!map->Instanceable())
         {
             map->RemoveRespawnTime(SPAWN_TYPE_GAMEOBJECT, guid, nullptr, true);

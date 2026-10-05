@@ -225,6 +225,13 @@ public:
             player->SaveRecallPosition(); // save only in non-flight case
 
         Map const* map = sMapMgr->CreateBaseMap(mapId);
+        if (!map) // nullptr on a cluster node that does not own this map
+        {
+            handler->PSendSysMessage(LANG_INVALID_TARGET_COORD, x, y, mapId);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
         float z = std::max(map->GetHeight(x, y, MAX_HEIGHT), map->GetWaterLevel(x, y));
 
         player->TeleportTo(mapId, x, y, z, player->GetOrientation());
@@ -276,6 +283,12 @@ public:
         ASSERT(zoneEntry);
 
         Map const* map = sMapMgr->CreateBaseMap(zoneEntry->ContinentID);
+        if (!map) // nullptr on a cluster node that does not own this map
+        {
+            handler->PSendSysMessage(LANG_INVALID_TARGET_COORD, x, y, zoneEntry->ContinentID);
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
 
         if (map->Instanceable())
         {
@@ -328,6 +341,12 @@ public:
                 return false;
             }
             Map const* map = sMapMgr->CreateBaseMap(mapId);
+            if (!map) // nullptr on a cluster node that does not own this map
+            {
+                handler->PSendSysMessage(LANG_INVALID_TARGET_COORD, x, y, mapId);
+                handler->SetSentErrorMessage(true);
+                return false;
+            }
             z = std::max(map->GetHeight(x, y, MAX_HEIGHT), map->GetWaterLevel(x, y));
         }
 
