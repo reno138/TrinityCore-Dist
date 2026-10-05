@@ -168,7 +168,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `src/server/game/CMakeLists.txt:49-53`
 
 **Interfaces:**
-- Produces: CMake target `nats_static`, linked PRIVATE into `game`. `<nats/nats.h>` is only included from `NatsBus.cpp` (Task 6).
+- Produces: CMake target `nats_static`, linked PRIVATE into `game`. `<nats.h>` (the target exports `dep/cnats/src` as its include dir) is only included from `NatsBus.cpp` (Task 6).
 
 - [ ] **Step 1: Copy the vendored client**
 
