@@ -92,7 +92,7 @@ The map is extended as the port finds new deltas; every entry added is a one-lin
 - **Databases:** `tc_auth`, `tc_characters`, `tc_world` on mariadb-01; world from the latest TDB 335 full dump; TC's updater runs on node 1 only; node 2 `Updates.EnableDatabases = 0`.
 - **Bus:** `c9-nats` on wow-node-01:4222, same `ClusterServer.AuthKey`. AC and TC worldservers must never be on the bus at the same time (shared subjects).
 - **Client data:** TC extractors on node 1 from the QNAP `wow-335` share → `~/tc-335/data` (dbc, maps, vmaps). **mmaps skipped in phase 1**, `mmap.enablePathFinding = 0`.
-- **Realm split for the test:** node 1 = maps 0, 530 + zone 1637 (Orgrimmar); node 2 = maps 1, 571.
+- **Realm split for the test (amended 2026-10-05):** a node that advertises zones never claims a map (`ClusterMgr::RegisterRemoteNode`, announce encoder), so the zone node must be separate. Three nodes: node 1 = maps 0, 530; node 2 = maps 1, 571; node 3 (wow-node-03, VM 172, 192.0.2.22) = zone 1637 with `ClusterServer.Maps = "1"` for local terrain (not advertised). Runbook: `docs/superpowers/port/phase1-test-log.md`.
 - **Node MTU** stays 1500 on the routed VLANs (DBnet path).
 
 ## 7. Failure handling
@@ -102,6 +102,7 @@ The map is extended as the port finds new deltas; every entry added is a one-lin
 - **Runtime:** `Logger.network = 3`; `PacketTrace.Enable` and `RedirectDebug` on for the test window only (RedirectDebug logs session keys); tcpdump + offline ARC4-drop1024 decrypt (HMAC-SHA1(seeds, session_key) for redirect connections) when the packet stream is in question. Reassemble by byte offset, not per segment.
 - **Rollback:** stop TC services, start AC services. TC databases are separate; the AC realm is never at risk.
 - **Known gaps carried over unchanged:** destination never verifies the client's 20-byte redirect proof; ghosts do not hand off; zone nodes must also own their zones' maps (spawning is not zone-scoped); AntiDOS policy is whatever TC ships.
+- **Deliberate deviations from AC in the built phase 1 (decided during execution, 2026-10-05):** the redirect auth path follows TC's own login path where the two differ (encrypted error replies, ban/IP-lock/country-lock checks before the token wait, mute-time fix-up); `WorldPacketCrypt::Init(K, serverKey, clientKey)` is used as-is (it equals AC's `InitRedirect`, so the AuthCrypt hunk was not ported); RBAC permissions load before `AddSession` on the redirect path; crash/null-safety and save-before-load fixes listed as APPLIED in `docs/superpowers/improvements.md` (items 3–9).
 
 ## 8. Improvement register
 
