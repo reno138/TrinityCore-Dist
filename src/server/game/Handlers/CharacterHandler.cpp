@@ -21,6 +21,8 @@
 #include "CharacterCache.h"
 #include "CharacterPackets.h"
 #include "Chat.h"
+#include "ClientRedirect.h"
+#include "ClusterMgr.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
 #include "EquipmentSetPackets.h"
@@ -39,6 +41,7 @@
 #include "Metric.h"
 #include "MiscPackets.h"
 #include "MotionMaster.h"
+#include "NatsBus.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -49,9 +52,12 @@
 #include "Realm.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
+#include "SharedPlayerCache.h"
+#include "SharedPlayerState.h"
 #include "SocialMgr.h"
 #include "StringConvert.h"
 #include "SystemPackets.h"
+#include "Transport.h"
 #include "QueryHolder.h"
 #include "World.h"
 
@@ -735,7 +741,310 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
         return;
     }
 
+    // Cluster: apply shared cache position FIRST so zone checks use the real
+    // position (not stale DB). During redirect, the player's DB position might
+    // Cluster: if the player's map is owned by a different node,
+    // redirect the client to the owning node via SMSG_REDIRECT_CLIENT.
+    // Trust the DB — SaveToDB runs synchronously before redirect.
+    if (sClusterMgr.IsEnabled())
+    {
+        std::optional<ClusterNodeInfo> destNode;
+        std::string reason;
+
+        // The NATS transfer carries the authoritative destination map and arrives
+        // before the client reconnects. The DB map may be stale — the teleporting
+        // node saves asynchronously and the write can lose the race. Use the
+        // transfer map when present; fall back to DB only for cold logins.
+        uint32 checkMap = sClusterMgr.PeekPendingTransferMapId(playerGuid.GetRawValue())
+                              .value_or(pCurrChar->GetMapId());
+
+        TC_LOG_INFO("server.worldserver", "CharacterHandler: checkMap={} IsMapLocal={} nodeId={} for player {}",
+                 checkMap, sClusterMgr.IsMapLocal(checkMap), sClusterMgr.GetNodeId(), pCurrChar->GetName());
+
+        if (!sClusterMgr.IsMapLocal(checkMap))
+        {
+            destNode = sClusterMgr.GetNodeForMap(checkMap);
+            reason = fmt::format("map {}", checkMap);
+        }
+        // Zone-level redirect is NOT done at login. The client can't handle
+        // SMSG_REDIRECT_CLIENT during the login sequence — it hangs. Let the
+        // player load on this node and the in-world dwell timer will handle
+        // zone routing after they enter the world.
+
+        if (destNode)
+        {
+            uint64 const charGuid = pCurrChar->GetGUID().GetRawValue();
+
+            // If this session arrived via SMSG_REDIRECT_CLIENT the client is already
+            // in mid-redirect state and cannot handle a second SMSG_REDIRECT_CLIENT —
+            // it crashes with ERROR #134. Disconnect cleanly instead; the client will
+            // reconnect cold to the realm and be re-redirected safely from a clean state.
+            if (GetRedirectAutoLoginGuid() != 0)
+            {
+                TC_LOG_WARN("server.worldserver",
+                         "Player {} arrived via redirect but landed on wrong node ({}). "
+                         "Disconnecting without re-redirect to avoid client crash.",
+                         pCurrChar->GetName(), reason);
+                SetPlayer(nullptr);
+                delete pCurrChar;
+                m_playerLoading = false;
+                KickPlayer("wrong-node mid-redirect: disconnect to force clean cold reconnect");
+                return;
+            }
+
+            TC_LOG_INFO("server.worldserver", "Player {} on wrong node ({}), redirecting to node {} ({}:{})",
+                     pCurrChar->GetName(), reason, destNode->nodeId, destNode->address, destNode->port);
+
+            // Send full player state to the SPECIFIC dest node via NATS.
+            // Use the redirect variant which overrides position fields with
+            // the character's DB-loaded position (which IS the destination
+            // for cold-login — the character was saved there).
+            {
+                WorldLocation destLoc(pCurrChar->GetMapId(),
+                                      pCurrChar->GetPositionX(),
+                                      pCurrChar->GetPositionY(),
+                                      pCurrChar->GetPositionZ(),
+                                      pCurrChar->GetOrientation());
+                sNatsBus.SendPlayerTransferForRedirect(
+                    pCurrChar, destNode->nodeId, destLoc);
+            }
+
+            // Publish redirect token (no SMSG_SUSPEND_COMMS — it blocks the redirect)
+            uint32 const token = ClientRedirect::GenerateToken();
+            if (token == 0)
+            {
+                SetPlayer(nullptr);
+                delete pCurrChar;
+                m_playerLoading = false;
+                KickPlayer("redirect token generation failed");
+                return;
+            }
+            sNatsBus.PublishRedirectToken(GetAccountId(), charGuid, token,
+                                              destNode->nodeId, GetRemoteAddress(), ClusterAddonsFromSession(GetSecureAddons()));
+
+            // Redirect client to destination node
+            auto [redirectIp, redirectPort] = sClusterMgr.GetRedirectAddressForNode(
+                destNode->nodeId, GetRemoteAddress());
+            ClientRedirect::RedirectClient(this, redirectIp, redirectPort, token);
+
+            // Suspend the client on this (source) connection.  The client's
+            // 0x50F handler (0x633020) requires the packet on the MAIN
+            // connection — it checks [this+0x2E38] and drops non-main.
+            ClientRedirect::SuspendClient(this);
+
+            // Clean up — client will disconnect and reconnect to dest node.
+            // Mark as redirected so the session teardown skips AnnounceOffline/SaveToDB.
+            // Nothing may reach the client on this connection from here on
+            // (SendPacket drops it once redirected out); the aura/talent
+            // teardown below would otherwise stream hundreds of packets to the
+            // suspended connection and break the redirect.
+            SetRedirectedOut();
+            SetPlayer(nullptr);
+            pCurrChar->RemoveAllAuras();
+            delete pCurrChar;
+            m_playerLoading = false;
+            return;
+        }
+    }
+
     pCurrChar->GetMotionMaster()->Initialize();
+
+    // Cluster: apply pending NATS transfer state if this login was triggered
+    // by a cross-node reroute. The transfer has fresher HP/mana/position/buffs
+    // than the DB (which may have stale async-saved data).
+    // Track whether Block 1 consumed a transfer so Block 2 (shared cache) can
+    // be skipped — Block 2's Relocate would overwrite the transport position
+    // that Block 1 just calculated, causing the passenger to fall off the transport.
+    bool hadNatsTransfer = false;
+    if (sClusterMgr.IsEnabled())
+    {
+        auto transfer = sClusterMgr.TakePendingTransfer(playerGuid.GetRawValue());
+        if (transfer)
+        {
+            hadNatsTransfer = true;
+            TC_LOG_INFO("server.worldserver",
+                     "Applying NATS transfer for {} from map {} pos ({:.1f},{:.1f},{:.1f})",
+                     pCurrChar->GetName(), transfer->mapId, transfer->posX, transfer->posY, transfer->posZ);
+
+            // Position
+            pCurrChar->Relocate(transfer->posX, transfer->posY, transfer->posZ, transfer->orientation);
+
+            // Vitals
+            pCurrChar->SetHealth(std::min(transfer->health, pCurrChar->GetMaxHealth()));
+            // The transfer carries no death state. A player handed over with 0 HP
+            // is dead; without this the session stays "alive" with 0 HP, the
+            // release request is ignored and the next hit kills them again.
+            if (transfer->health == 0 && pCurrChar->IsAlive())
+                pCurrChar->KillPlayer();
+            if (transfer->power <= pCurrChar->GetMaxPower(Powers(transfer->powerType)))
+                pCurrChar->SetPower(Powers(transfer->powerType), transfer->power);
+
+            // Transport - find matching transport on this node and attach
+            TC_LOG_INFO("server.worldserver",
+                     "Block1 transport check: onTransport={} entry={} offset=({:.2f},{:.2f},{:.2f})",
+                     transfer->transport.onTransport, transfer->transport.entry,
+                     transfer->transport.offsetX, transfer->transport.offsetY, transfer->transport.offsetZ);
+            if (transfer->transport.onTransport && transfer->transport.entry != 0)
+            {
+                // Iterate motion transports to find one with matching GO entry
+                Transport* foundTransport = nullptr;
+                {
+                    auto& container = HashMapHolder<Transport>::GetContainer();
+                    std::shared_lock lock(*HashMapHolder<Transport>::GetLock());
+                    for (auto const& pair : container)
+                    {
+                        if (pair.second->GetEntry() == transfer->transport.entry)
+                        {
+                            foundTransport = pair.second;
+                            break;
+                        }
+                    }
+                }
+                if (foundTransport && foundTransport->GetMapId() == transfer->mapId)
+                {
+                    float tx = transfer->transport.offsetX;
+                    float ty = transfer->transport.offsetY;
+                    float tz = transfer->transport.offsetZ;
+                    float to = transfer->transport.offsetO;
+                    foundTransport->AddPassenger(pCurrChar);
+                    pCurrChar->SetTransport(foundTransport);
+                    pCurrChar->AddUnitState(UNIT_STATE_IGNORE_PATHFINDING);
+                    pCurrChar->m_movementInfo.transport.guid = foundTransport->GetGUID();
+                    pCurrChar->m_movementInfo.transport.pos.Relocate(tx, ty, tz, to);
+                    pCurrChar->m_movementInfo.AddMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+                    // Calculate world position from transport offset
+                    float wx = tx, wy = ty, wz = tz, wo = to;
+                    foundTransport->CalculatePassengerPosition(wx, wy, wz, &wo);
+                    pCurrChar->Relocate(wx, wy, wz, wo);
+                    TC_LOG_INFO("server.worldserver",
+                             "Block1 transport reattach OK: entry={} map={} worldPos=({:.1f},{:.1f},{:.1f})",
+                             foundTransport->GetEntry(), foundTransport->GetMapId(), wx, wy, wz);
+                }
+                else
+                {
+                    TC_LOG_WARN("server.worldserver",
+                             "Block1 transport reattach SKIPPED: entry={} {}",
+                             transfer->transport.entry,
+                             foundTransport
+                                 ? fmt::format("found but on map={} not map={}", foundTransport->GetMapId(), transfer->mapId)
+                                 : "not found on this node");
+                    // Transport not on this map yet (not found, or found but mid-teleport
+                    // on wrong map): queue deferred reattach. Player::Update retries
+                    // every 200ms for up to 2.5s, waiting for the transport to arrive.
+                    {
+                        WorldSession::PendingTransportAttach pa;
+                        pa.entry   = transfer->transport.entry;
+                        pa.mapId   = transfer->mapId;
+                        pa.offsetX = transfer->transport.offsetX;
+                        pa.offsetY = transfer->transport.offsetY;
+                        pa.offsetZ = transfer->transport.offsetZ;
+                        pa.offsetO = transfer->transport.offsetO;
+                        SetPendingTransportAttach(pa);
+                    }
+                }
+            }
+
+            // Store pet transfer for deferred application (after pet spawns)
+            SetPendingPetTransfer(std::make_shared<TransferPetInfo>(transfer->pet));
+
+            // Auras come from the save the source committed before publishing
+            // this transfer (exact amounts, charges, remaining time, original
+            // caster), loaded by LoadFromDB above. They used to be stripped here
+            // and re-created from the snapshot with the player as caster, which
+            // lost all of that and also removed the passive auras from talents
+            // and equipment that nothing re-applied until the next relog.
+        }
+    }
+
+    // Cluster: broadcast full player state to all nodes now that Block 1 has
+    // applied transport reattach and final position. The redirect path already
+    // uses SendPlayerTransferForRedirect for the dest node, so this only fires
+    // for players that are actually entering the world on this node.
+    if (sClusterMgr.IsEnabled() && sNatsBus.IsConnected())
+    {
+        sNatsBus.BroadcastPlayerTransferFull(pCurrChar);
+        TC_LOG_INFO("server.worldserver", "Cluster: Broadcast full state for {} to all nodes after login", pCurrChar->GetName());
+    }
+
+    // Cluster: activate player from shared cache if this is a transfer login.
+    // The cache has real-time state from the source node — fresher than DB.
+    // Skip if Block 1 already applied a pending NATS transfer: that transfer
+    // carries the correct transport position; applying the shared cache on top
+    // would Relocate the player to non-transport world coords, causing a fall.
+    if (sClusterMgr.IsEnabled() && !hadNatsTransfer)
+    {
+        auto cachedState = sSharedPlayerCache.Get(playerGuid.GetRawValue());
+        if (cachedState && cachedState->ownerNodeId != sNatsBus.GetNodeId())
+        {
+            TC_LOG_INFO("server.worldserver", "Activating {} from shared cache (from node {})",
+                     pCurrChar->GetName(), cachedState->ownerNodeId);
+
+            // Apply cached position
+            pCurrChar->Relocate(cachedState->posX, cachedState->posY, cachedState->posZ, cachedState->posO);
+
+            // Apply cached vitals
+            pCurrChar->SetHealth(std::min(cachedState->health, pCurrChar->GetMaxHealth()));
+            if (cachedState->power <= pCurrChar->GetMaxPower(Powers(cachedState->powerType)))
+                pCurrChar->SetPower(Powers(cachedState->powerType), cachedState->power);
+
+            // Apply cached transport — find Transport by entry and reattach
+            if (cachedState->transportEntry != 0)
+            {
+                Transport* foundTransport = nullptr;
+                {
+                    auto& container = HashMapHolder<Transport>::GetContainer();
+                    std::shared_lock lock(*HashMapHolder<Transport>::GetLock());
+                    for (auto const& pair : container)
+                    {
+                        if (pair.second->GetEntry() == cachedState->transportEntry)
+                        {
+                            foundTransport = pair.second;
+                            break;
+                        }
+                    }
+                }
+                if (foundTransport)
+                {
+                    float tx = cachedState->transOffX;
+                    float ty = cachedState->transOffY;
+                    float tz = cachedState->transOffZ;
+                    float to = cachedState->transOffO;
+                    foundTransport->AddPassenger(pCurrChar);
+                    pCurrChar->m_movementInfo.transport.guid = foundTransport->GetGUID();
+                    pCurrChar->m_movementInfo.transport.pos.Relocate(tx, ty, tz, to);
+                    pCurrChar->m_movementInfo.AddMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+                    float wx = tx, wy = ty, wz = tz, wo = to;
+                    foundTransport->CalculatePassengerPosition(wx, wy, wz, &wo);
+                    pCurrChar->Relocate(wx, wy, wz, wo);
+                    TC_LOG_INFO("server.worldserver", "Restored {} to transport entry {} at offset ({:.1f},{:.1f},{:.1f})",
+                             pCurrChar->GetName(), cachedState->transportEntry, tx, ty, tz);
+                }
+                else
+                {
+                    TC_LOG_WARN("server.worldserver", "Transport entry {} not found on this node for {}",
+                             cachedState->transportEntry, pCurrChar->GetName());
+                }
+            }
+
+            // Auras are not taken from the cache either (see the transfer
+            // block above): the committed pre-handoff save is exact, whereas
+            // stripping and re-adding cached auras with the player as caster
+            // lost amounts, charges and casters, removed talent/equipment
+            // passives for good, and re-applied area auras such as the paladin
+            // auras with their apply visual on every single hop.
+
+            // Update cache ownership to this node
+            sSharedPlayerCache.UpdateFromPlayer(playerGuid.GetRawValue(), [](SharedPlayerState& s) {
+                s.ownerNodeId = sNatsBus.GetNodeId();
+                s.active = true;
+            });
+
+            // Broadcast updated ownership + full transfer data
+            sNatsBus.BroadcastPlayerStateFull(playerGuid.GetRawValue());
+            sNatsBus.BroadcastPlayerTransferFull(pCurrChar);
+        }
+    }
+
     pCurrChar->SendDungeonDifficulty(true, false);
     pCurrChar->SendRaidDifficulty(true, false);
 
@@ -750,7 +1059,9 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     SendFeatureSystemStatus();
 
-    // Send MOTD
+    // Send MOTD, but not on a handoff arrival: the client has been in the
+    // world the whole time and already saw it on its real login.
+    if (GetRedirectAutoLoginGuid() == 0)
     {
         WorldPackets::System::MOTD motd;
         motd.Text = &sWorld->GetMotd();
@@ -825,16 +1136,37 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     ObjectAccessor::AddObject(pCurrChar);
     //TC_LOG_DEBUG("Player {} added to Map.", pCurrChar->GetName());
 
+    // Note: Map::SendInitSelf (called inside AddPlayerToMap above) already sends the
+    // transport CREATE_OBJECT before the player's own CREATE_OBJECT2 when GetTransport()
+    // is non-null.  No manual pre-send needed here — that caused a triple-send which
+    // destroyed the transport sound emitter on the client.
+    // On a NATS transfer arrival the player enters via the login path
+    // (PlayerLoading=true). UpdateLocalChannels skips when PlayerLoading &&
+    // !IsBeingTeleportedFar — set the semaphore so it treats this as a teleport
+    // and sends the correct zone channel joins to the client.
+    if (hadNatsTransfer)
+        pCurrChar->SetSemaphoreTeleportFar(true);
+
     pCurrChar->SendInitialPacketsAfterAddToMap();
 
+    // Clear the semaphore now that SendInitialPacketsAfterAddToMap has run.
+    if (pCurrChar->IsBeingTeleportedFar())
+        pCurrChar->SetSemaphoreTeleportFar(false);
+
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
-    stmt->setUInt8(0, 0); // owning node id; Task 8 replaces the 0 with sClusterMgr.GetNodeId()
+    stmt->setUInt8(0, sClusterMgr.GetNodeId());
     stmt->setUInt32(1, pCurrChar->GetGUID().GetCounter());
     CharacterDatabase.Execute(stmt);
 
     LoginDatabasePreparedStatement* loginStmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_ONLINE);
     loginStmt->setUInt32(0, GetAccountId());
     LoginDatabase.Execute(loginStmt);
+
+    // After a NATS transfer the source node saved asynchronously — the DB may
+    // still reflect the old map/position. Commit now so the DB is authoritative
+    // before any subsequent login or redirect decision reads it.
+    if (hadNatsTransfer)
+        pCurrChar->SaveToDB(false);
 
     pCurrChar->SetInGameTime(GameTime::GetGameTimeMS());
 
@@ -850,6 +1182,10 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     // friend status
     sSocialMgr->SendFriendStatus(pCurrChar, FRIEND_ONLINE, pCurrChar->GetGUID(), true);
+
+    // cluster: announce login to other worldserver nodes
+    if (sNatsBus.IsConnected())
+        sNatsBus.AnnounceOnline(pCurrChar);
 
     // Place character in world (and load zone) before some object loading
     pCurrChar->LoadCorpse(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_CORPSE_LOCATION));
@@ -996,6 +1332,13 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     }
 
     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
+
+    // Cluster: the redirect auto-login GUID has now served both of its readers
+    // (the wrong-node guard above and the LOGINEFFECT skip inside
+    // SendInitialPacketsAfterAddToMap). Clear it here, not in
+    // InitializeSessionCallback — the login is asynchronous, so clearing it
+    // right after firing CMSG_PLAYER_LOGIN meant neither reader ever saw it.
+    SetRedirectAutoLoginGuid(0);
 
     TC_METRIC_EVENT("player_events", "Login", pCurrChar->GetName());
 }
