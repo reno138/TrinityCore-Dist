@@ -33,8 +33,10 @@
 #include "Chat.h"
 #include "ChatCommand.h"
 #include <cstring>
+#include <iostream>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <unistd.h>
 #else
 #include <Windows.h>
 #endif
@@ -118,12 +120,24 @@ void CliThread()
     // later it will be printed after command queue updates
     PrintCliPrefix();
 #else
-    ::rl_attempted_completion_function = &Trinity::Impl::Readline::cli_completion;
+    // readline is only meaningful on a terminal. Under a supervisor (nodemgr,
+    // systemd) stdin is /dev/null or a pipe: readline() then returns NULL at
+    // once, but because it reads the descriptor itself feof(stdin) never becomes
+    // true, so the loop below used to re-print the prompt at full speed and fill
+    // the disk with "TC> ". A non-tty stdin is read line-by-line instead, and EOF
+    // on it ends the console thread — not the server.
+    bool const stdinIsTty = ::isatty(STDIN_FILENO) == 1;
+    if (stdinIsTty)
     {
-        static char BLANK = '\0';
-        ::rl_completer_word_break_characters = &BLANK;
+        ::rl_attempted_completion_function = &Trinity::Impl::Readline::cli_completion;
+        {
+            static char BLANK = '\0';
+            ::rl_completer_word_break_characters = &BLANK;
+        }
+        ::rl_event_hook = &Trinity::Impl::Readline::cli_hook_func;
     }
-    ::rl_event_hook = &Trinity::Impl::Readline::cli_hook_func;
+    else
+        TC_LOG_INFO("server.worldserver", "Console: stdin is not a terminal — line mode, no readline (EOF ends the console, not the server)");
 #endif
 
     if (sConfigMgr->GetBoolDefault("BeepAtStart", true))
@@ -152,12 +166,30 @@ void CliThread()
         if (!ReadWinConsole(command))
             continue;
 #else
-        char* command_str = readline(CLI_PREFIX);
-        ::rl_bind_key('\t', ::rl_complete);
-        if (command_str != nullptr)
+        if (stdinIsTty)
         {
+            char* command_str = readline(CLI_PREFIX);
+            ::rl_bind_key('\t', ::rl_complete);
+            if (command_str == nullptr)
+            {
+                // Ctrl-D / EOF on an interactive console: the operator asked
+                // the server to go down (upstream semantics).
+                World::StopNow(SHUTDOWN_EXIT_CODE);
+                break;
+            }
             command = command_str;
             free(command_str);
+        }
+        else
+        {
+            // Supervised / piped stdin. Block on the next line; on EOF the
+            // console simply ends. The world keeps running — a supervisor
+            // closing our stdin is not a shutdown request.
+            if (!std::getline(std::cin, command))
+            {
+                TC_LOG_INFO("server.worldserver", "Console: stdin closed — console thread exiting, server continues");
+                return;
+            }
         }
 #endif
 
@@ -175,12 +207,15 @@ void CliThread()
             fflush(stdout);
             sWorld->QueueCliCommand(new CliCommandHolder(nullptr, command.c_str(), &utf8print, &commandFinished));
 #if TRINITY_PLATFORM != TRINITY_PLATFORM_WINDOWS
-            add_history(command.c_str());
+            if (stdinIsTty)
+                add_history(command.c_str());
 #endif
         }
+#if TRINITY_PLATFORM == TRINITY_PLATFORM_WINDOWS
         else if (feof(stdin))
         {
             World::StopNow(SHUTDOWN_EXIT_CODE);
         }
+#endif
     }
 }

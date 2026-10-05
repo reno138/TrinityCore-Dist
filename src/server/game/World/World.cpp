@@ -35,6 +35,7 @@
 #include "Chat.h"
 #include "ChatCommand.h"
 #include "ChatPackets.h"
+#include "ClusterMgr.h"
 #include "Config.h"
 #include "CreatureAIRegistry.h"
 #include "CreatureGroups.h"
@@ -60,6 +61,7 @@
 #include "Memory.h"
 #include "Metric.h"
 #include "MMapFactory.h"
+#include "NatsBus.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "OutdoorPvPMgr.h"
@@ -1592,7 +1594,16 @@ void World::LoadConfigSettings(bool reload)
 
     // call ScriptMgr if we're reloading the configuration
     if (reload)
+    {
+        // Refresh cached cluster tunables so ".reload config" applies them live
+        // (redirect-debug / packet-trace flags and the NatsBus interval/node cache).
+        // Only on reload — at startup these are primed by ClusterMgr::LoadLocalMaps
+        // and NatsBus::Initialize, which run before this during worldserver Main.
+        sClusterMgr.RefreshPacketTraceConfig();
+        sNatsBus.RefreshConfigCache();
+
         sScriptMgr->OnConfigLoad(reload);
+    }
 }
 
 /// Initialize the World
@@ -1625,18 +1636,26 @@ void World::SetInitialWorldSettings()
     sObjectMgr->SetHighestGuids();
 
     ///- Check the existence of the map files for all races' startup areas.
-    if (!MapManager::ExistMapAndVMap(0, -6240.32f, 331.033f)
-        || !MapManager::ExistMapAndVMap(0, -8949.95f, -132.493f)
-        || !MapManager::ExistMapAndVMap(1, -618.518f, -4251.67f)
-        || !MapManager::ExistMapAndVMap(0, 1676.35f, 1677.45f)
-        || !MapManager::ExistMapAndVMap(1, 10311.3f, 832.463f)
-        || !MapManager::ExistMapAndVMap(1, -2917.58f, -257.98f)
-        || (m_int_configs[CONFIG_EXPANSION] && (
-            !MapManager::ExistMapAndVMap(530, 10349.6f, -6357.29f) ||
-            !MapManager::ExistMapAndVMap(530, -3961.64f, -13931.2f))))
+    // Instance servers skip continent maps entirely — no .map files needed for them.
+    if (!sConfigMgr->GetBoolDefault("InstanceServer.Enable", false))
     {
-        TC_LOG_FATAL("server.loading", "Unable to load critical files - server shutting down !!!");
-        exit(1);
+        if (!MapManager::ExistMapAndVMap(0, -6240.32f, 331.033f)
+            || !MapManager::ExistMapAndVMap(0, -8949.95f, -132.493f)
+            || !MapManager::ExistMapAndVMap(1, -618.518f, -4251.67f)
+            || !MapManager::ExistMapAndVMap(0, 1676.35f, 1677.45f)
+            || !MapManager::ExistMapAndVMap(1, 10311.3f, 832.463f)
+            || !MapManager::ExistMapAndVMap(1, -2917.58f, -257.98f)
+            || (m_int_configs[CONFIG_EXPANSION] && (
+                !MapManager::ExistMapAndVMap(530, 10349.6f, -6357.29f) ||
+                !MapManager::ExistMapAndVMap(530, -3961.64f, -13931.2f))))
+        {
+            TC_LOG_FATAL("server.loading", "Unable to load critical files - server shutting down !!!");
+            exit(1);
+        }
+    }
+    else
+    {
+        TC_LOG_INFO("server.loading", "Instance server mode: skipping continent map file checks.");
     }
 
     ///- Initialize pool manager
@@ -2229,7 +2248,10 @@ void World::SetInitialWorldSettings()
     sBattlefieldMgr->InitBattlefield();
 
     TC_LOG_INFO("server.loading", "Loading Transports...");
-    sTransportMgr->SpawnContinentTransports();
+    if (!sConfigMgr->GetBoolDefault("InstanceServer.Enable", false))
+        sTransportMgr->SpawnContinentTransports();
+    else
+        TC_LOG_INFO("server.loading", "Instance server mode: skipping continent transport spawning.");
 
     ///- Initialize Warden
     TC_LOG_INFO("server.loading", "Loading Warden Checks...");
@@ -2272,6 +2294,9 @@ void World::SetInitialWorldSettings()
     TC_LOG_INFO("server.worldserver", "World initialized in {} minutes {} seconds", (startupDuration / 60000), ((startupDuration % 60000) / 1000));
 
     TC_METRIC_EVENT("events", "World initialized", "World initialized in " + std::to_string(startupDuration / 60000) + " minutes " + std::to_string((startupDuration % 60000) / 1000) + " seconds");
+
+    if (sNatsBus.IsConnected())
+        sNatsBus.SetWorldReady();
 }
 
 void World::DetectDBCLang()
@@ -2381,6 +2406,17 @@ void World::Update(uint32 diff)
         sWhoListStorageMgr->Update();
     }
 
+    if (m_timers[WUPDATE_CLUSTER].Passed())
+    {
+        m_timers[WUPDATE_CLUSTER].Reset();
+
+        // Cluster: send 10s heartbeat + 5min refresh to proxy when due.
+        sNatsBus.Update();
+
+        // Cluster: evict pending transfers/redirects that were never consumed.
+        sClusterMgr.PurgeStaleEntries(getMSTime());
+    }
+
     if (IsStopped() || m_timers[WUPDATE_CHANNEL_SAVE].Passed())
     {
         m_timers[WUPDATE_CHANNEL_SAVE].Reset();
@@ -2465,6 +2501,35 @@ void World::Update(uint32 diff)
         /// <li> Handle session updates when the timer has passed
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update sessions"));
         UpdateSessions(diff);
+    }
+
+    // Cluster: process player deactivations from ownership transfers.
+    // This runs after session updates but before map updates, so it is safe
+    // to remove players from maps here.
+    {
+        std::vector<uint64> deactivations;
+        {
+            std::lock_guard<std::mutex> lock(_deactivateQueueMutex);
+            deactivations.swap(_playerDeactivateQueue);
+        }
+        for (uint64 guid : deactivations)
+        {
+            if (Player* player = ObjectAccessor::FindPlayer(GuidFromRaw(guid)))
+            {
+                TC_LOG_INFO("server.worldserver", "World: Deactivating player {} (GUID {:016X}) -- ownership transferred to another node",
+                    player->GetName(), guid);
+                player->RemoveAllAuras();
+                if (WorldSession* session = player->GetSession())
+                    session->SetPlayer(nullptr);
+                // Do NOT close the socket here. The client may still need the
+                // old connection alive while it transitions to the new node.
+                // The client will close it when ready, or the session will
+                // time out naturally.
+                if (player->IsInWorld())
+                    if (Map* map = player->FindMap())
+                        map->RemovePlayerFromMap(player, true);
+            }
+        }
     }
 
     /// <li> Update uptime table
@@ -2606,6 +2671,12 @@ void World::Update(uint32 diff)
             DoGuidWarningRestart();
         else if (_warnDiff > getIntConfig(CONFIG_RESPAWN_GUIDWARNING_FREQUENCY) * IN_MILLISECONDS)
             SendGuidWarning();
+    }
+
+    {
+        TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Process pending callbacks"));
+        // Drain callbacks posted from I/O threads (e.g. NatsBus → LFGMgr calls)
+        ProcessPendingCallbacks();
     }
 
     {

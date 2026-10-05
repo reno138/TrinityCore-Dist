@@ -22,6 +22,7 @@
 #include "BattlegroundMgr.h"
 #include "BigNumber.h"
 #include "CliRunnable.h"
+#include "ClusterMgr.h"
 #include "Configuration/Config.h"
 #include "DatabaseEnv.h"
 #include "DatabaseLoader.h"
@@ -33,6 +34,7 @@
 #include "MapManager.h"
 #include "Metric.h"
 #include "MySQLThreading.h"
+#include "NatsBus.h"
 #include "ObjectAccessor.h"
 #include "OpenSSLCrypto.h"
 #include "OutdoorPvP/OutdoorPvPMgr.h"
@@ -127,6 +129,9 @@ int main(int argc, char** argv)
 {
     Trinity::Impl::CurrentServerProcessHolder::_type = SERVER_PROCESS_WORLDSERVER;
     signal(SIGABRT, &Trinity::AbortHandler);
+#if TRINITY_PLATFORM != TRINITY_PLATFORM_WINDOWS
+    signal(SIGPIPE, SIG_IGN); // cnats writes to a raw socket
+#endif
 
     Trinity::VerifyOsVersion();
 
@@ -316,6 +321,26 @@ int main(int argc, char** argv)
         sScriptMgr->Unload();
         sScriptReloadMgr->Unload();
     });
+
+    // Connect to NATS cluster bus BEFORE loading the world so that
+    // SpawnContinentTransports() can query peer transport PathProgress values
+    // via NatsBus::QueryTransportSync() during SetInitialWorldSettings().
+    // (Handlers are queued via QueueCallback, so no race with in-flight world state.)
+    if (sConfigMgr->GetIntDefault("ClusterServer.NodeId", 0) > 0)
+    {
+        sClusterMgr.LoadLocalMaps();
+
+        std::string natsUrl     = sConfigMgr->GetStringDefault("ClusterServer.NatsURL", "nats://127.0.0.1:4222");
+        std::string gameAddress = sConfigMgr->GetStringDefault("ClusterServer.GameAddress", "127.0.0.1");
+        // Read port from config directly — sWorld->getIntConfig(CONFIG_PORT_WORLD) isn't
+        // populated until SetInitialWorldSettings() runs below.
+        uint16 gamePort = static_cast<uint16>(
+            sConfigMgr->GetIntDefault("ClusterServer.GamePort",
+                sConfigMgr->GetIntDefault("WorldServerPort", 8085)));
+        uint8 serverType = (sConfigMgr->GetBoolDefault("ClusterServer.InstanceServer", false) ||
+                            sConfigMgr->GetBoolDefault("InstanceServer.Enable", false)) ? 1 : 0;
+        sNatsBus.Initialize(natsUrl, serverType, gamePort, gameAddress);
+    }
 
     // Initialize the World
     sSecretMgr->Initialize();
@@ -700,8 +725,13 @@ void ClearOnlineAccounts()
     // Reset online status for all accounts with characters on the current realm
     LoginDatabase.DirectPExecute("UPDATE account SET online = 0 WHERE online > 0 AND id IN (SELECT acctid FROM realmcharacters WHERE realmid = {})", realm.Id.Realm);
 
-    // Reset online status for all characters
-    CharacterDatabase.DirectExecute("UPDATE characters SET online = 0 WHERE online <> 0");
+    // Reset online status only for characters owned by THIS node. In a cluster, other
+    // nodes may still be running — a blanket reset would incorrectly clear their sessions.
+    uint8 nodeId = uint8(sConfigMgr->GetIntDefault("ClusterServer.NodeId", 0));
+    if (nodeId > 0)
+        CharacterDatabase.DirectPExecute("UPDATE characters SET online = 0, owning_node_id = 0 WHERE owning_node_id = {}", nodeId);
+    else
+        CharacterDatabase.DirectExecute("UPDATE characters SET online = 0 WHERE online <> 0");
 
     // Battleground instance ids reset at server restart
     CharacterDatabase.DirectExecute("UPDATE character_battleground_data SET instanceId = 0");

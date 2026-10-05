@@ -38,6 +38,8 @@
 #    PACKET SPOOF PROTECTION SETTINGS
 #    MISC ANTI-CHEAT SETTINGS
 #    METRIC SETTINGS
+#    INSTANCE SERVER MODE
+#    CLUSTER SERVER
 #
 ###################################################################################################
 
@@ -358,6 +360,9 @@ ChangeWeatherInterval = 600000
 #
 #    PlayerSaveInterval
 #        Description: Time (in milliseconds) for player save interval.
+#                     On cluster builds a full synchronous save is forced before any
+#                     cross-node redirect, so this interval only covers the data-loss
+#                     window for players who disconnect without a redirect.
 #        Default:     90000 - (90 seconds)
 
 PlayerSaveInterval = 90000
@@ -4170,6 +4175,303 @@ Metric.OverallStatusInterval = 1
 
 #Metric.Threshold.world_update_sessions_time = 100
 #Metric.Threshold.worldsession_update_opcode_time = 50
+
+#
+###################################################################################################
+
+###################################################################################################
+# INSTANCE SERVER MODE
+#
+#    InstanceServer.Enable
+#        Description: Legacy single-purpose instance-server mode (pre-cluster). When enabled,
+#                     MapMgr skips loading non-instanceable maps, BattlefieldMgr is disabled,
+#                     and World init skips global state for continent zones — i.e. this server
+#                     ONLY hosts dungeons/raids/BGs/arenas.
+#                     For cluster-aware instance routing, use ClusterServer.InstanceServer
+#                     instead — it does NOT disable continent map loading and works with the
+#                     pool/reservation systems that depend on the full map set.
+#        Default:     0 - (Normal worldserver mode)
+#                     1 - (Legacy instance-only mode)
+
+InstanceServer.Enable = 0
+
+#
+#    InstanceServer.Address
+#        Description: LFG fallback address. When the LFG matchmaker forms a group whose
+#                     dungeon lives on a remote instance node, it normally asks the cluster
+#                     (via NATS) for the least-loaded instance node's address. If that query
+#                     fails (e.g. during startup before peers are discovered), it falls back
+#                     to this static address for the SMSG_REDIRECT_CLIENT sent to grouped
+#                     players. Set to a reachable instance node's IP/host.
+#        Default:     "127.0.0.1"
+
+InstanceServer.Address = "127.0.0.1"
+
+#
+#    InstanceServer.Port
+#        Description: LFG fallback port — paired with InstanceServer.Address. Used in the
+#                     same NATS-query-fallback path. Should match the WorldServerPort of
+#                     the configured instance node.
+#        Default:     8087
+
+InstanceServer.Port = 8087
+
+#
+###################################################################################################
+
+###################################################################################################
+# CLUSTER SERVER
+#
+# Cluster mode is always on in this build — there is no master enable flag.
+# A worldserver becomes a cluster participant by virtue of having a NodeId
+# and a reachable NatsURL. Set ClusterServer.Maps = "" and run a single node
+# for "standalone" behavior (one node owns all maps).
+#
+#    ClusterServer.NodeId
+#        Description: Unique integer ID for this node within the cluster. Must be distinct
+#                     across all worldserver instances. Typically 1–8.
+#        Default:     1
+
+ClusterServer.NodeId = 1
+
+#
+#    ClusterServer.AuthKey
+#        Description: Shared secret authenticating every message on the NATS cluster
+#                     bus. All nodes in a cluster MUST share the same value.
+#
+#                     The bus carries privileged control messages, including
+#                     MSG_RA_COMMAND (executes an arbitrary server console command)
+#                     and MSG_CLUSTER_PLAYER_ONLINE (disconnects a matching local
+#                     session). Without a key, any host able to reach the NATS port
+#                     can do both on every node.
+#
+#                     Frames are authenticated with HMAC-SHA256 and carry a
+#                     timestamp and nonce, giving a 30-second replay window.
+#                     This provides authenticity and integrity, NOT confidentiality
+#                     — enable TLS on NATS itself if the bus crosses an untrusted
+#                     network.
+#
+#                     Must be at least 32 bytes. If unset or too short the cluster
+#                     bus refuses to start (fail-closed by design).
+#
+#                     Generate with:  openssl rand -hex 32
+#
+#        Default:     "" - (disabled; cluster bus will NOT start)
+#
+
+ClusterServer.AuthKey = ""
+
+#
+#    ClusterServer.AllowRemoteConsole
+#        Description: Allow this node to execute console commands received over the
+#                     cluster bus (MSG_RA_COMMAND) from clustermgr.
+#
+#                     This is the highest-privilege message in the cluster protocol
+#                     — it is equivalent to granting console access to whoever holds
+#                     ClusterServer.AuthKey. Commands run with full server authority
+#                     (account creation, GM level changes, shutdown).
+#
+#                     Enable only on nodes you intend to administer remotely, and
+#                     only when ClusterServer.AuthKey is set to a strong secret.
+#
+#        Default:     0 - (disabled, commands are rejected and logged)
+#                     1 - (enabled)
+#
+
+ClusterServer.AllowRemoteConsole = 0
+
+
+#
+#    ClusterServer.NatsURL
+#        Description: NATS server URL for the cluster control channel. All inter-node messages
+#                     (player directory, BG queues, chat relay, group updates, transport sync,
+#                     node health, etc.) are exchanged via this broker.
+#        Default:     "nats://127.0.0.1:4222"
+
+ClusterServer.NatsURL = "nats://127.0.0.1:4222"
+
+#
+#    ClusterServer.GameAddress
+#        Description: This node's LAN IP address, advertised to peer nodes via the NATS
+#                     cluster.announce message. Peers use this address for internal
+#                     server-to-server communication. Set to the actual LAN IP of this machine.
+#        Default:     "127.0.0.1"
+
+ClusterServer.GameAddress = "127.0.0.1"
+
+#
+#    ClusterServer.GamePort
+#        Description: The game port this worldserver listens on for client connections.
+#                     Must match WorldServerPort. Advertised to peers via cluster.announce.
+#        Default:     8085
+
+ClusterServer.GamePort = 8085
+
+#
+#    ClusterServer.RedirectAddress
+#        Description: Address sent to WoW clients in SMSG_REDIRECT_CLIENT when they need to
+#                     connect to this node. Set this to your public/external IP so that both
+#                     LAN and internet clients receive a reachable address.
+#                     If empty, GameAddress (the LAN IP) is used instead — only suitable
+#                     for LAN-only deployments where all clients can reach internal IPs directly.
+#        Example:     "203.0.113.232"
+#        Default:     "" (use GameAddress)
+
+ClusterServer.RedirectAddress = ""
+
+#
+#    ClusterServer.RedirectPort
+#        Description: Port sent to WoW clients in SMSG_REDIRECT_CLIENT. Typically the same as
+#                     GamePort, or the NAT-mapped external port if they differ.
+#                     Only used when RedirectAddress is set.
+#        Default:     0 (use GamePort)
+
+ClusterServer.RedirectPort = 0
+
+#
+#    ClusterServer.Maps
+#        Description: Comma-separated list of map IDs owned by this node. Players teleporting
+#                     to a map not in this list are redirected to the node that owns it.
+#                     Leave empty ("") to own all maps — use for standalone or dev mode.
+#        Example:     Node 1: "0,1"       (Eastern Kingdoms + Kalimdor)
+#                     Node 2: "530,571"   (Outland + Northrend)
+#                     Node 3: ""          (instance catch-all)
+#        Default:     ""
+
+ClusterServer.Maps = ""
+
+#
+#    ClusterServer.Zones
+#        Description: Comma-separated list of zone IDs this node handles. Zone-level routing
+#                     is finer-grained than map-level — used when a single map is split across
+#                     nodes by zone. Leave empty to handle all zones on owned maps.
+#        Default:     ""
+
+ClusterServer.Zones = ""
+
+#
+#    ClusterServer.InstanceServer
+#        Description: Designates this node as the cluster's instance handler. When set,
+#                     ClusterMgr ignores ClusterServer.Maps and claims ALL instanceable maps
+#                     (dungeons, raids, battlegrounds, arenas) for routing. Continent maps
+#                     are still loaded — this is the cluster-aware mode and is the correct
+#                     flag for a multi-node cluster's instance node. Do NOT use this
+#                     together with InstanceServer.Enable (the legacy global flag).
+#        Default:     0 - (Regular world node — owns maps from ClusterServer.Maps)
+#                     1 - (Instance node — owns all instanceable maps)
+
+ClusterServer.InstanceServer = 0
+
+#
+#    ClusterServer.BgCoordinatorNode
+#        Description: Node ID of the preferred BG coordinator. Used to restore coordinator
+#                     assignment when a previously dead coordinator node comes back online.
+#        Default:     1
+
+ClusterServer.BgCoordinatorNode = 1
+
+#
+#    ClusterServer.LFGMasterNode
+#        Description: Node ID of the node that runs the authoritative LFG/LFD queue.
+#                     Non-master nodes relay queue requests to this node via NATS.
+#        Default:     1
+
+ClusterServer.LFGMasterNode = 1
+
+#
+#    ClusterServer.NodeDeadThreshold
+#        Description: Seconds without a heartbeat before a peer is declared dead. Maps are
+#                     removed from the routing table, MSG_NODE_DEAD is broadcast, and the BG
+#                     coordinator is re-elected. The node is automatically restored on its
+#                     next cluster.announce or heartbeat.
+#                     Must be greater than the heartbeat interval (default 10 s).
+#        Default:     30
+
+ClusterServer.NodeDeadThreshold = 30
+
+#
+#    ClusterServer.NodeDeadTimeout
+#        Description: Milliseconds after a node is declared dead before its orphaned maps are
+#                     formally released from the routing table. Gives the dead node a grace
+#                     period to restart before its maps are claimed by another node.
+#        Default:     60000
+
+ClusterServer.NodeDeadTimeout = 60000
+
+#
+#    ClusterServer.HeartbeatInterval
+#        Description: How often (in seconds) this node broadcasts a MSG_NODE_STATUS heartbeat
+#                     to all peers. Peers use this to detect dead nodes via NodeDeadThreshold.
+#        Default:     300
+
+ClusterServer.HeartbeatInterval = 300
+
+#
+#    ClusterServer.TransportSyncInterval
+#        Description: How often (in seconds) this node broadcasts transport PathProgress to all
+#                     peers (MSG_TRANSPORT_SYNC). Keeps zeppelin/ship positions consistent across
+#                     the cluster. On startup a one-shot peer query seeds positions immediately.
+#                     Set to 0 to disable periodic broadcast (not recommended).
+#        Default:     60
+
+ClusterServer.TransportSyncInterval = 60
+
+#
+#    ClusterServer.MgmtStatusInterval
+#        Description: How often (in seconds) this node publishes a health snapshot to
+#                     cluster.mgmt.status. Consumed by the clustermgr TUI/web UI.
+#                     Set to 0 to disable.
+#        Default:     5
+
+ClusterServer.MgmtStatusInterval = 5
+
+#
+#    ClusterServer.MgmtPlayersInterval
+#        Description: How often (in seconds) this node publishes online player positions to
+#                     cluster.mgmt.players. Consumed by the clustermgr map viewer.
+#                     Set to 0 to disable (recommended for high-population servers).
+#        Default:     3
+
+ClusterServer.MgmtPlayersInterval = 3
+
+#
+#    ClusterServer.PacketTrace.Enable
+#        Description: Enables verbose packet + state trace logging for cluster login and
+#                     redirect flows. Logs all opcodes at the WorldSocket layer plus
+#                     state-transition markers in login, teleport, and redirect handlers.
+#                     Critical packets (SMSG_REDIRECT_CLIENT, SMSG_NEW_WORLD, etc.) are
+#                     dumped in full hex for bit-for-bit comparison across nodes.
+#                     Output goes to logger "cluster.packettrace". Suggested config:
+#                         Appender.PacketTrace=2,5,0,PacketTrace.log,w,1
+#                         Logger.cluster.packettrace=5,PacketTrace
+#                     Leave disabled in production — extremely verbose.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+ClusterServer.PacketTrace.Enable = 0
+
+#
+#    ClusterServer.RedirectDebug
+#        Description: Verbose diagnostics for cross-node client redirects, emitted
+#                     from ClientRedirect::RedirectClient on every redirect when
+#                     enabled. Logs the full account session key, the HMAC input
+#                     bytes, and five candidate HMAC variants (reverse-key,
+#                     key+token, byte-swapped ip/port, and auth-seed-only) that
+#                     were used to reverse-engineer the 3.3.5a client's redirect
+#                     handshake. Output goes to logger "server.worldserver".
+#                     This does NOT change the packet sent to the client — the
+#                     transmitted HMAC proof is the same whether enabled or not;
+#                     only logging (and the extra throwaway HMAC computations) is
+#                     gated. Reads live: change it and run ".reload config" to
+#                     toggle without restarting.
+#                     SECURITY: enabling this writes the raw 40-byte session key
+#                     to the log on every transfer. Never enable on a production
+#                     node with real accounts — use only for protocol debugging
+#                     on an isolated test realm.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+ClusterServer.RedirectDebug = 0
 
 #
 ###################################################################################################
