@@ -1,0 +1,2558 @@
+/*
+ * This file is part of the C9Core Project. See AUTHORS file for Copyright information
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "NatsBus.h"
+#include "ClusterAuth.h"
+#include <nats.h>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+#include "ArenaTeam.h"
+#include "ArenaTeamMgr.h"
+#include "Battleground.h"
+#include "BattlegroundMgr.h"
+#include "BattlegroundQueue.h"
+#include "ClusterMgr.h"
+#include "DatabaseEnv.h"
+#include "Position.h"
+#include "PlayerTransfer.h"
+#include "SharedPlayerCache.h"
+#include "PlayerStateSync.h"
+#include "GameTime.h"
+#include "Config.h"
+#include "SpellAuras.h"
+#include "DBCStores.h"
+#include "LFGMgr.h"
+#include "SocialMgr.h"
+#include "Player.h"
+#include "Transport.h"
+#include "ObjectAccessor.h"
+#include "Group.h"
+#include "Log.h"
+#include "Opcodes.h"
+#include "World.h"
+#include "WorldPacket.h"
+#include <chrono>
+#include <cstring>
+#include <cctype>
+#include <algorithm>
+#include <memory>
+#include <shared_mutex>
+
+// ── Initialize (peer-to-peer NATS) ───────────────────────────────────────────
+
+void NatsBus::Initialize(std::string const& natsUrl, uint8 serverType,
+                              uint16 gamePort, std::string const& gameAddress)
+{
+    _natsUrl        = natsUrl;
+    _serverType     = serverType;
+    _gamePort       = gamePort;
+    _gameAddress    = gameAddress;
+    _startupTimeMs  = getMSTime();
+
+    // NodeId comes from config — no proxy request-reply needed.
+    _nodeId = static_cast<uint8>(sConfigMgr->GetIntDefault("ClusterServer.NodeId", 0));
+    if (_nodeId == 0)
+    {
+        TC_LOG_ERROR("server.worldserver",
+                  "NatsBus: ClusterServer.NodeId not set or is 0 — cluster disabled");
+        return;
+    }
+
+    // Cluster bus authentication. This fails CLOSED: without a usable key the
+    // bus does not come up at all. Running unauthenticated is not a supported
+    // configuration — MSG_RA_COMMAND alone makes it equivalent to handing out
+    // a root console to anyone who can reach the NATS port.
+    std::string const authKey = sConfigMgr->GetStringDefault("ClusterServer.AuthKey", "");
+    if (!ClusterAuth::Init(authKey))
+    {
+        TC_LOG_FATAL("server.worldserver",
+                  "NatsBus: ClusterServer.AuthKey missing or shorter than {} bytes — cluster bus refuses to start. "
+                  "Generate one with: openssl rand -hex 32",
+                  ClusterAuth::MIN_KEY_BYTES);
+        return;
+    }
+
+    // Read transport sync broadcast interval (seconds) from config.
+    int32 const syncIntervalSec = sConfigMgr->GetIntDefault(
+        "ClusterServer.TransportSyncInterval", 60);
+    _transportSyncIntervalMs = (syncIntervalSec > 0)
+        ? static_cast<uint32>(syncIntervalSec) * 1000u
+        : 0u;
+
+    // Initialize BG coordinator to the configured node (may change on failover).
+    _bgCoordNodeId = static_cast<uint8>(sConfigMgr->GetIntDefault("ClusterServer.BgCoordinatorNode", 1));
+
+    // Cache the tunables that Update()/relay send-paths would otherwise read from
+    // the config map every tick. Re-read live on ".reload config".
+    RefreshConfigCache();
+
+    if (!ConnectNATS())
+    {
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus: Initial NATS connect failed — will retry every 10s in Update()");
+        return;
+    }
+
+    // Defer announce until World is fully initialized.
+    _lastAnnounceRetryMs = getMSTime();
+
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Connected to NATS as node {} (serverType={}, gamePort={} addr={}) "
+             "transport_sync_interval={}s",
+             _nodeId, serverType, gamePort, gameAddress, syncIntervalSec);
+}
+
+/// Connect to NATS and subscribe to all required subjects.
+/// Returns true on success.  On failure cleans up and returns false.
+bool NatsBus::ConnectNATS()
+{
+    // Connect to NATS.
+    // Clean up stale handles from previous failed attempt
+    if (_subTransportQuery) { natsSubscription_Destroy(_subTransportQuery); _subTransportQuery = nullptr; }
+    if (_subAnnounce) { natsSubscription_Destroy(_subAnnounce); _subAnnounce = nullptr; }
+    if (_subBroadcast) { natsSubscription_Destroy(_subBroadcast); _subBroadcast = nullptr; }
+    if (_subNode) { natsSubscription_Destroy(_subNode); _subNode = nullptr; }
+    if (_nc) { natsConnection_Destroy(_nc); _nc = nullptr; }
+
+    // Let cnats own reconnection. With MaxReconnect = -1 it retries forever,
+    // buffers publishes while the server is away, and re-establishes every
+    // subscription on its own — so a NATS restart or a network blip never
+    // needs the worldserver to notice. Before this the library gave up after
+    // its default 60 attempts (~2 min), the connection went CLOSED, and
+    // because _connected was never cleared this node stayed "connected" to a
+    // dead handle until a process restart.
+    natsOptions* opts = nullptr;
+    natsStatus s = natsOptions_Create(&opts);
+    if (s == NATS_OK) s = natsOptions_SetURL(opts, _natsUrl.c_str());
+    if (s == NATS_OK) s = natsOptions_SetMaxReconnect(opts, -1);
+    if (s == NATS_OK) s = natsOptions_SetReconnectWait(opts, 2000);
+    if (s == NATS_OK) s = natsOptions_SetDisconnectedCB(opts, OnNatsDisconnected, this);
+    if (s == NATS_OK) s = natsOptions_SetReconnectedCB(opts, OnNatsReconnected, this);
+    if (s == NATS_OK) s = natsOptions_SetClosedCB(opts, OnNatsClosed, this);
+    if (s == NATS_OK) s = natsConnection_Connect(&_nc, opts);
+    natsOptions_Destroy(opts);
+    if (s != NATS_OK)
+    {
+        _nc = nullptr;
+        TC_LOG_ERROR("server.worldserver", "NatsBus: Failed to connect to NATS at {} — {}",
+                  _natsUrl, natsStatus_GetText(s));
+        return false;
+    }
+
+    // Subscribe to messages directed at this node.
+    std::string nodeSub = "cluster.node." + std::to_string(_nodeId);
+    s = natsConnection_Subscribe(&_subNode, _nc, nodeSub.c_str(), OnNatsMsg, this);
+    if (s != NATS_OK)
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: Failed to subscribe to {} — {}",
+                  nodeSub, natsStatus_GetText(s));
+        natsConnection_Destroy(_nc);
+        _nc = nullptr;
+        return false;
+    }
+
+    // Subscribe to broadcast fanout (all nodes).
+    s = natsConnection_Subscribe(&_subBroadcast, _nc, "cluster.broadcast", OnNatsMsg, this);
+    if (s != NATS_OK)
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: Failed to subscribe to cluster.broadcast — {}",
+                  natsStatus_GetText(s));
+        natsSubscription_Destroy(_subNode);
+        _subNode = nullptr;
+        natsConnection_Destroy(_nc);
+        _nc = nullptr;
+        return false;
+    }
+
+    // Subscribe to peer discovery announcements.
+    s = natsConnection_Subscribe(&_subAnnounce, _nc, "cluster.announce", OnAnnounceMsg, this);
+    if (s != NATS_OK)
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: Failed to subscribe to cluster.announce — {}",
+                  natsStatus_GetText(s));
+        natsSubscription_Destroy(_subBroadcast);
+        _subBroadcast = nullptr;
+        natsSubscription_Destroy(_subNode);
+        _subNode = nullptr;
+        natsConnection_Destroy(_nc);
+        _nc = nullptr;
+        return false;
+    }
+
+    // Subscribe to transport sync queries (new nodes query us on startup to seed
+    // their transport positions without depending on the system clock).
+    s = natsConnection_Subscribe(&_subTransportQuery, _nc,
+                                  "cluster.transport.query", OnTransportQueryMsg, this);
+    if (s != NATS_OK)
+    {
+        // Non-fatal: transport sync falls back to system_clock epoch.
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus: Failed to subscribe to cluster.transport.query — {} "
+                 "(transport sync will use system clock as fallback)",
+                 natsStatus_GetText(s));
+    }
+
+    _connected = true;
+    return true;
+}
+
+// ── nats.c connection lifecycle callbacks ────────────────────────────────────
+// All three run on a cnats-internal thread. They must not touch game state.
+
+void NatsBus::OnNatsDisconnected(natsConnection* nc, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+    if (nc != self->_nc)
+        return; // stale handle from a previous ConnectNATS()
+    // Deliberately NOT clearing _connected: cnats is reconnecting on its own and
+    // buffering our publishes. Clearing the flag here would make Update()'s
+    // retry path destroy the very connection that is about to recover.
+    TC_LOG_WARN("server.worldserver", "NatsBus: NATS connection lost — library is reconnecting");
+}
+
+void NatsBus::OnNatsReconnected(natsConnection* nc, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+    if (nc != self->_nc)
+        return;
+    // Peers may have declared us dead while we were away; re-announce so they
+    // re-register our maps/zones and un-flag us. Done from Update() (world thread).
+    self->_reannouncePending = true;
+    TC_LOG_INFO("server.worldserver", "NatsBus: NATS connection restored — re-announce queued");
+}
+
+void NatsBus::OnNatsClosed(natsConnection* nc, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+    if (nc != self->_nc)
+        return; // our own natsConnection_Destroy in ConnectNATS(); ignore
+    // Only reachable if reconnection is exhausted (it isn't, MaxReconnect=-1)
+    // or the library hit an unrecoverable error. Hand control back to
+    // Update()'s 10-second reconnect loop.
+    self->_connected = false;
+    TC_LOG_ERROR("server.worldserver", "NatsBus: NATS connection CLOSED — Update() will reconnect");
+}
+
+// ── NATS publish helpers ──────────────────────────────────────────────────────
+
+void NatsBus::PublishToNode(uint8 targetNodeId, uint8 msgType,
+                                 uint8 const* payload, int payloadLen)
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Wire format: authenticated frame (see ClusterAuth.h). The legacy
+    // [msgType:1][payload] format is no longer emitted or accepted — an
+    // unauthenticated bus allows any host that can reach NATS to execute
+    // MSG_RA_COMMAND console commands on every node.
+    std::vector<uint8> buf = ClusterAuth::Seal(_nodeId, msgType,
+                                               payloadLen > 0 ? payload : nullptr,
+                                               static_cast<std::size_t>(payloadLen));
+    if (buf.empty())
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: refusing to publish msgType 0x{:02X} — cluster auth not initialised", msgType);
+        return;
+    }
+
+    std::string subject = "cluster.node." + std::to_string(targetNodeId);
+    natsStatus s = natsConnection_Publish(_nc, subject.c_str(),
+                                          buf.data(), static_cast<int>(buf.size()));
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus: Publish to {} failed — {}",
+                 subject, natsStatus_GetText(s));
+    else
+        _natsBytesTx.fetch_add(static_cast<uint32>(buf.size()), std::memory_order_relaxed);
+}
+
+void NatsBus::PublishBroadcast(uint8 msgType, uint8 const* payload, int payloadLen)
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Wire format: authenticated frame (see ClusterAuth.h).
+    std::vector<uint8> buf = ClusterAuth::Seal(_nodeId, msgType,
+                                               payloadLen > 0 ? payload : nullptr,
+                                               static_cast<std::size_t>(payloadLen));
+    if (buf.empty())
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: refusing to broadcast msgType 0x{:02X} — cluster auth not initialised", msgType);
+        return;
+    }
+
+    natsStatus s = natsConnection_Publish(_nc, "cluster.broadcast",
+                                          buf.data(), static_cast<int>(buf.size()));
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus: Broadcast publish failed — {}",
+                 natsStatus_GetText(s));
+    else
+        _natsBytesTx.fetch_add(static_cast<uint32>(buf.size()), std::memory_order_relaxed);
+}
+
+void NatsBus::PublishSealed(std::string const& subject, uint8 msgType,
+                            uint8 const* payload, std::size_t payloadLen)
+{
+    if (!_nc || !_connected)
+        return;
+
+    std::vector<uint8> buf = ClusterAuth::Seal(_nodeId, msgType,
+                                               payloadLen ? payload : nullptr, payloadLen);
+    if (buf.empty())
+    {
+        TC_LOG_ERROR("server.worldserver", "NatsBus: refusing to publish msgType 0x{:02X} to {} — cluster auth not initialised",
+                  msgType, subject);
+        return;
+    }
+
+    natsStatus s = natsConnection_Publish(_nc, subject.c_str(),
+                                          buf.data(), static_cast<int>(buf.size()));
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus: Publish to {} failed — {}",
+                 subject, natsStatus_GetText(s));
+    else
+        _natsBytesTx.fetch_add(static_cast<uint32>(buf.size()), std::memory_order_relaxed);
+}
+
+void NatsBus::PublishAnnounce()
+{
+    if (!_nc)
+        return;
+
+    // Wire format for cluster.announce:
+    //   [nodeId:1][serverType:1][gamePort:2][addrLen:1][addr:n]
+    //   [mapCount:2][mapIds:4*n][zoneCount:2][zoneIds:4*n]
+    //   [redirectAddrLen:1][redirectAddr:n][redirectPort:2]
+    // redirectAddr is the address sent to clients in SMSG_CONNECT_TO.
+    // Empty (len=0) means use the LAN address. Appended last for compatibility.
+    // If this node has zones configured, it's a zones-only node — don't
+    // announce maps, because Maps config just tells the worldserver what
+    // terrain to load. The map is OWNED by another node; we only own zones.
+    auto localZones = sClusterMgr.GetLocalZones();
+    auto localMaps = localZones.empty() ? sClusterMgr.GetLocalMaps() : std::unordered_set<uint32>{};
+    uint16 mapCount = static_cast<uint16>(localMaps.size());
+    uint8  addrLen  = static_cast<uint8>(_gameAddress.size());
+
+    std::string const& redirectAddr = sClusterMgr.GetRedirectAddress();
+    uint16 const        redirectPort = sClusterMgr.GetRedirectPort();
+    uint8  redirectAddrLen = static_cast<uint8>(redirectAddr.size());
+
+    std::vector<uint8> buf;
+    buf.reserve(6 + addrLen + mapCount * 4 + 3 + redirectAddrLen);
+    buf.push_back(_nodeId);
+    buf.push_back(_serverType);
+    buf.push_back(static_cast<uint8>(_gamePort & 0xFF));
+    buf.push_back(static_cast<uint8>(_gamePort >> 8));
+    buf.push_back(addrLen);
+    buf.insert(buf.end(), _gameAddress.begin(), _gameAddress.end());
+    buf.push_back(static_cast<uint8>(mapCount & 0xFF));
+    buf.push_back(static_cast<uint8>(mapCount >> 8));
+    for (uint32 mapId : localMaps)
+    {
+        buf.push_back(static_cast<uint8>(mapId & 0xFF));
+        buf.push_back(static_cast<uint8>((mapId >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8>((mapId >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8>((mapId >> 24) & 0xFF));
+    }
+
+    // Append zone data: [zoneCount:2][zoneIds:4*n]
+    uint16 zoneCount = static_cast<uint16>(localZones.size());
+    buf.push_back(static_cast<uint8>(zoneCount & 0xFF));
+    buf.push_back(static_cast<uint8>(zoneCount >> 8));
+    for (uint32 zoneId : localZones)
+    {
+        buf.push_back(static_cast<uint8>(zoneId & 0xFF));
+        buf.push_back(static_cast<uint8>((zoneId >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8>((zoneId >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8>((zoneId >> 24) & 0xFF));
+    }
+
+    // Append redirect address: [redirectAddrLen:1][redirectAddr:n][redirectPort:2]
+    buf.push_back(redirectAddrLen);
+    buf.insert(buf.end(), redirectAddr.begin(), redirectAddr.end());
+    buf.push_back(static_cast<uint8>(redirectPort & 0xFF));
+    buf.push_back(static_cast<uint8>(redirectPort >> 8));
+
+    // Sealed like every other subject: the announce carries the redirect
+    // address that clients are later told to connect to, so an unauthenticated
+    // announce would let anyone on the NATS port steer live players to a host
+    // of their choosing.
+    PublishSealed("cluster.announce", MSG_ANNOUNCE, buf.data(), buf.size());
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Published cluster.announce (nodeId={} maps={} zones={})", _nodeId, mapCount, zoneCount);
+}
+
+/// Called on the NATS dispatch thread for cluster.announce messages.
+void NatsBus::OnAnnounceMsg(natsConnection* /*nc*/, natsSubscription* /*sub*/,
+                                  natsMsg* msg, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+
+    const uint8* raw = reinterpret_cast<const uint8*>(natsMsg_GetData(msg));
+    int rawLen       = natsMsg_GetDataLength(msg);
+    self->_natsBytesRx.fetch_add(static_cast<uint32>(rawLen), std::memory_order_relaxed);
+
+    // Authenticate first; the payload vector is a copy so the message can be
+    // released immediately.
+    uint8 srcNodeId = 0;
+    uint8 msgType   = 0;
+    std::vector<uint8> payload;
+    bool const authentic = ClusterAuth::Open(raw, static_cast<std::size_t>(rawLen),
+                                             srcNodeId, msgType, payload);
+    natsMsg_Destroy(msg);
+
+    if (!authentic || msgType != MSG_ANNOUNCE)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: dropped unauthenticated/replayed cluster.announce ({} bytes)", rawLen);
+        return;
+    }
+
+    // Skip our own announce.
+    if (srcNodeId == self->_nodeId)
+        return;
+
+    const uint8* d = payload.data();
+    int n          = static_cast<int>(payload.size());
+
+    // Minimum: nodeId(1)+serverType(1)+gamePort(2)+addrLen(1)+addr(1)+mapCount(2) = 8 bytes
+    if (n < 8)
+        return;
+
+    uint8  nodeId     = d[0];
+    uint8  serverType = d[1];
+    uint16 gamePort   = static_cast<uint16>(d[2]) | (static_cast<uint16>(d[3]) << 8);
+    uint8  addrLen    = d[4];
+
+    // The tag binds the frame to srcNode; the payload must not claim otherwise.
+    if (nodeId != srcNodeId)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: announce from node {} claims nodeId {} — dropped", srcNodeId, nodeId);
+        return;
+    }
+
+    if (n < 5 + addrLen + 2)
+        return;
+
+    std::string address(reinterpret_cast<char const*>(d + 5), addrLen);
+    int off = 5 + addrLen;
+
+    uint16 mapCount = static_cast<uint16>(d[off]) | (static_cast<uint16>(d[off + 1]) << 8);
+    off += 2;
+
+    // Reject rather than clamp: clamping used to advance the cursor by the
+    // clamped count, so an announce with >128 maps had its zone list parsed
+    // out of the middle of the map array.
+    if (mapCount > 128)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: announce from node {} lists {} maps (max 128) — dropped", nodeId, mapCount);
+        return;
+    }
+
+    if (n < off + mapCount * 4)
+        return;
+
+    ClusterNodeInfo info;
+    info.nodeId  = nodeId;
+    info.address = address;
+    info.port    = gamePort;
+    info.type    = serverType;
+    for (uint16 i = 0; i < mapCount; ++i)
+    {
+        uint32 mapId = 0;
+        std::memcpy(&mapId, d + off + i * 4, 4);
+        info.maps.insert(mapId);
+    }
+    off += mapCount * 4;  // advance past map data
+
+    // Parse zone data: [zoneCount:2][zoneIds:4*n]
+    if (n >= off + 2)
+    {
+        uint16 zoneCount = static_cast<uint16>(d[off]) | (static_cast<uint16>(d[off + 1]) << 8);
+        off += 2;
+        if (zoneCount > 128)
+        {
+            TC_LOG_WARN("server.worldserver", "NatsBus: announce from node {} lists {} zones (max 128) — dropped", nodeId, zoneCount);
+            return;
+        }
+        if (n >= off + zoneCount * 4)
+        {
+            for (uint16 i = 0; i < zoneCount; ++i)
+            {
+                uint32 zoneId = 0;
+                std::memcpy(&zoneId, d + off + i * 4, 4);
+                info.zones.insert(zoneId);
+            }
+            // Advance past the zone ids. This was missing, so for any node
+            // announcing zones the redirect-address section that follows was
+            // parsed from the first zone id's bytes (e.g. zone 4395 = 0x112B
+            // read as redirectAddrLen 43) and the real redirect address was
+            // never seen.
+            off += zoneCount * 4;
+        }
+    }
+
+    // Parse redirect address (appended last — optional for compatibility):
+    // [redirectAddrLen:1][redirectAddr:n][redirectPort:2]
+    if (n >= off + 1)
+    {
+        uint8 redirectAddrLen = d[off++];
+        if (redirectAddrLen > 0 && n >= off + redirectAddrLen + 2)
+        {
+            info.redirectAddress = std::string(reinterpret_cast<char const*>(d + off), redirectAddrLen);
+            off += redirectAddrLen;
+            info.redirectPort = static_cast<uint16>(d[off]) | (static_cast<uint16>(d[off + 1]) << 8);
+            TC_LOG_INFO("server.worldserver", "NatsBus: Parsed redirect for nodeId={} -> {}:{}",
+                     nodeId, info.redirectAddress, info.redirectPort);
+        }
+        else
+        {
+            TC_LOG_INFO("server.worldserver", "NatsBus: No redirect in announce for nodeId={} (len={} n={} off={})",
+                     nodeId, redirectAddrLen, n, off);
+        }
+    }
+
+    // Register on world thread (ClusterMgr is world-thread-safe via mutex).
+    // If the node was previously dead, RegisterRemoteNode returns true and we
+    // restore the BG coordinator assignment if it was that node's role.
+    sWorld->QueueCallback([info = std::move(info), announceNodeId = nodeId]() mutable
+    {
+        bool wasRevived = sClusterMgr.RegisterRemoteNode(std::move(info));
+        if (wasRevived)
+            sNatsBus.RestoreBgCoordIfNeeded(announceNodeId);
+    });
+
+    // Acknowledge receipt so the announcing node stops its 10-second retry loop.
+    // Must go through the sealed path: cluster.node.{N} is served by OnNatsMsg,
+    // which rejects anything that is not an authenticated frame. The previous
+    // raw 2-byte publish here was dropped by every peer, so no node ever saw
+    // an ACK and every node re-announced every 10 s for its whole lifetime.
+    uint8 const senderNodeId = self->_nodeId;
+    self->PublishToNode(nodeId, MSG_ANNOUNCE_ACK, &senderNodeId, 1);
+}
+
+// ── Incoming NATS message dispatcher ─────────────────────────────────────────
+
+/// Called on the NATS dispatch thread.  Copies payload and queues Dispatch() on the world thread.
+void NatsBus::OnNatsMsg(natsConnection* /*nc*/, natsSubscription* /*sub*/,
+                             natsMsg* msg, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+
+    const uint8* d = reinterpret_cast<const uint8*>(natsMsg_GetData(msg));
+    int n          = natsMsg_GetDataLength(msg);
+
+    if (n < 1)
+    {
+        natsMsg_Destroy(msg);
+        return;
+    }
+
+    self->_natsBytesRx.fetch_add(static_cast<uint32>(n), std::memory_order_relaxed);
+
+    // Authenticate before anything else looks at the contents. A frame that
+    // fails the tag, clock-skew or replay check is dropped without dispatch.
+    uint8 msgType = 0;
+    uint8 srcNodeId = 0;
+    std::vector<uint8> payload;
+    bool const authentic = ClusterAuth::Open(d, static_cast<std::size_t>(n),
+                                             srcNodeId, msgType, payload);
+    natsMsg_Destroy(msg);
+
+    if (!authentic)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: dropped unauthenticated/replayed cluster frame ({} bytes)", n);
+        return;
+    }
+
+    // A node must not be able to impersonate us; self-addressed frames are a
+    // sign of either a loop or a forgery attempt.
+    if (srcNodeId == self->_nodeId)
+        return;
+
+    // Marshal all messages to world thread.
+    sWorld->QueueCallback([self, msgType, srcNodeId, pl = std::move(payload)]() mutable
+    {
+        self->_lastFrameSrcNode = srcNodeId;
+        self->Dispatch(msgType, std::move(pl));
+    });
+}
+
+/// Called on the world thread — dispatches to the appropriate handler.
+void NatsBus::Dispatch(uint8 msgType, std::vector<uint8> payload)
+{
+    switch (msgType)
+    {
+        case MSG_CLUSTER_PLAYER_ONLINE:
+            HandleRemotePlayerOnline(payload);
+            break;
+        case MSG_CLUSTER_PLAYER_OFFLINE:
+        {
+            if (payload.size() < 9) break;
+            uint64 guid; std::memcpy(&guid, payload.data(), 8);
+            uint8 srcNodeId = payload[8];
+            if (srcNodeId == _nodeId) break; // our own broadcast — ignore
+            HandleRemotePlayerOffline(guid);
+            break;
+        }
+        case MSG_CLUSTER_RELAY_TO_NODE:
+        {
+            // targetNode(1) + innerType(1) + payloadLen(2) + innerPayload
+            if (payload.size() < 4) break;
+            uint8  innerType  = payload[1];
+            uint16 innerLen;  std::memcpy(&innerLen, payload.data() + 2, 2);
+            if (payload.size() < static_cast<std::size_t>(4 + innerLen)) break;
+            std::vector<uint8> innerPayload(payload.begin() + 4, payload.begin() + 4 + innerLen);
+            HandleIncomingRelay(innerType, innerPayload);
+            break;
+        }
+        case MSG_CLUSTER_GROUP_UPDATE:
+        {
+            if (payload.size() < 9) break;
+            uint64 gg; std::memcpy(&gg, payload.data(), 8);
+            uint8 mc = payload[8];
+            if (payload.size() < static_cast<std::size_t>(9 + mc * 11)) break;
+            std::vector<uint8> memberData(payload.begin() + 9, payload.begin() + 9 + mc * 11);
+            HandleGroupUpdate(gg, mc, memberData);
+            break;
+        }
+        case MSG_CLUSTER_GROUP_DISBAND:
+        {
+            if (payload.size() < 8) break;
+            uint64 gg; std::memcpy(&gg, payload.data(), 8);
+            HandleGroupDisband(gg);
+            break;
+        }
+        case MSG_CLUSTER_LFG_RELAY:
+        {
+            // sourceNodeId(1) + innerLen(2) + innerType(1) + innerPayload
+            // Mirrors the RELAY_RESP case below and the senders
+            // (SendLFGJoinRelay/LeaveRelay/ProposalResultRelay). Before this the
+            // length was not consumed, so HandleLFGRelay read the low byte of
+            // innerLen as the inner type and every relay from a non-master
+            // node fell through to "unknown inner type".
+            if (payload.size() < 4) break;
+            uint8 srcNode = payload[0];
+            uint16 pl;      std::memcpy(&pl, payload.data() + 1, 2);
+            if (pl < 1 || payload.size() < static_cast<std::size_t>(3 + pl)) break;
+            std::vector<uint8> inner(payload.begin() + 3, payload.begin() + 3 + pl);
+            HandleLFGRelay(srcNode, inner);
+            break;
+        }
+        case MSG_CLUSTER_LFG_RELAY_RESP:
+        {
+            // targetNode(1) + payloadLen(2) + innerType(1) + innerPayload
+            // Body layout mirrors the old TCP wire: innerType is first byte of the body.
+            if (payload.size() < 4) break;
+            uint16 pl;      std::memcpy(&pl, payload.data() + 1, 2);
+            if (pl < 1 || payload.size() < static_cast<std::size_t>(3 + pl)) break;
+            uint8  innerType = payload[3];
+            std::vector<uint8> inner(payload.begin() + 4, payload.begin() + 3 + pl);
+            HandleLFGRelayResponse(innerType, inner);
+            break;
+        }
+        case MSG_CLUSTER_UNIT_UPDATE:
+        {
+            if (payload.size() < 2) break;
+            uint16 pl; std::memcpy(&pl, payload.data(), 2);
+            if (payload.size() < static_cast<std::size_t>(2 + pl)) break;
+            std::vector<uint8> inner(payload.begin() + 2, payload.begin() + 2 + pl);
+            HandleUnitUpdate(inner);
+            break;
+        }
+        case MSG_CLUSTER_CHAT:
+        {
+            if (payload.size() < 3) break;
+            uint16 pl; std::memcpy(&pl, payload.data(), 2);
+            if (payload.size() < static_cast<std::size_t>(2 + pl)) break;
+            std::vector<uint8> inner(payload.begin() + 2, payload.begin() + 2 + pl);
+            // inner[0] is srcNodeId — skip if this is our own broadcast (already delivered locally)
+            if (!inner.empty() && inner[0] == _nodeId) break;
+            HandleIncomingChat(inner);
+            break;
+        }
+        case MSG_CLUSTER_NOTIFY_MAIL:
+        {
+            if (payload.size() < 8) break;
+            uint64 guid; std::memcpy(&guid, payload.data(), 8);
+            HandleIncomingMailNotify(guid);
+            break;
+        }
+        case MSG_CLUSTER_ARENA_RESULT:
+        {
+            if (payload.size() < 2) break;
+            uint16 pl; std::memcpy(&pl, payload.data(), 2);
+            if (payload.size() < static_cast<std::size_t>(2 + pl)) break;
+            std::vector<uint8> inner(payload.begin() + 2, payload.begin() + 2 + pl);
+            HandleIncomingArenaResult(inner);
+            break;
+        }
+        case MSG_CLUSTER_BG_QUEUE_JOIN:
+            // Coordinator-only: add player to BG queue and match when ready.
+            HandleBgQueueJoin(payload);
+            break;
+        case MSG_CLUSTER_BG_QUEUE_LEAVE:
+            // Coordinator-only: remove player from BG queue.
+            HandleBgQueueLeave(payload);
+            break;
+        case MSG_CLUSTER_BG_CREATE_INST:
+            // Instance node: create the BG and reply with BG_INST_CREATED.
+            HandleBgCreateInst(payload);
+            break;
+        case MSG_CLUSTER_BG_INST_CREATED:
+            // Coordinator-only: BG created on instance node; send BG_READY to player nodes.
+            HandleBgInstCreated(payload);
+            break;
+        case MSG_CLUSTER_BG_READY:
+            // Player nodes: invite matched players to the BG.
+            HandleBgReady(payload);
+            break;
+        case MSG_TRANSPORT_SYNC:
+            // Live correction: apply PathProgress values from a peer node.
+            HandleTransportSync(payload);
+            break;
+        case MSG_NODE_STATUS:
+            // Heartbeat from a peer node — update its lastSeen timestamp.
+            HandleNodeStatus(payload);
+            break;
+        case MSG_NODE_DEAD:
+            // A peer node detected that another node died — sync our routing table.
+            HandleNodeDeadMsg(payload);
+            break;
+        case MSG_PING:
+        {
+            // Echo timestamp back as MSG_PONG on cluster.broadcast.
+            // With peer-to-peer, any node can initiate pings; we broadcast the pong
+            // so the pinger can measure round-trip latency regardless of nodeId.
+            if (payload.size() < 8) break;
+            uint64 ts; std::memcpy(&ts, payload.data(), 8);
+            uint8 pongBuf[8];
+            std::memcpy(pongBuf, &ts, 8);
+            PublishBroadcast(MSG_PONG, pongBuf, 8);
+            break;
+        }
+        case MSG_PONG:
+            // Silently discard — pong is only consumed by the sender; peers ignore it.
+            break;
+        case MSG_ANNOUNCE_ACK:
+            HandleAnnounceAck(payload);
+            break;
+        case MSG_RA_COMMAND:
+        {
+            // Remote console execution. Even with an authenticated bus this is
+            // the highest-privilege message in the protocol, so it is opt-in per
+            // node rather than always-on.
+            if (!sConfigMgr->GetBoolDefault("ClusterServer.AllowRemoteConsole", false))
+            {
+                TC_LOG_WARN("server.worldserver",
+                         "NatsBus: rejected MSG_RA_COMMAND from node {} — ClusterServer.AllowRemoteConsole is disabled",
+                         _lastFrameSrcNode);
+                break;
+            }
+            // reqId(4) + cmdLen(2) + cmd[cmdLen]
+            if (payload.size() < 6) break;
+            uint32 reqId;  std::memcpy(&reqId,  payload.data(),     4);
+            uint16 cmdLen; std::memcpy(&cmdLen, payload.data() + 4, 2);
+            if (payload.size() < 6u + cmdLen) break;
+            std::string cmd(reinterpret_cast<const char*>(payload.data() + 6), cmdLen);
+            HandleRACommand(reqId, cmd);
+            break;
+        }
+        case MSG_PLAYER_TRANSFER:
+        {
+            // Actual transfer handoff — only sent when a redirect is about to happen.
+            // Stores as pending transfer for the dest node's login handler.
+            PlayerTransferData td;
+            if (DeserializeTransfer(payload.data(), payload.size(), td))
+            {
+                TC_LOG_INFO("server.worldserver",
+                         "NatsBus: Received player transfer GUID {:016X} map={}",
+                         td.guid, td.mapId);
+                sClusterMgr.StorePendingTransfer(td.guid, std::move(td));
+            }
+            else
+                TC_LOG_ERROR("server.worldserver", "NatsBus: Failed to deserialize player transfer");
+            break;
+        }
+        case MSG_PLAYER_STATE_SYNC_V2:
+        {
+            // Continuous state sync — updates the shared cache, does NOT store as pending transfer.
+            // This keeps all nodes aware of all players without interfering with transfer handoffs.
+            PlayerTransferData td;
+            if (DeserializeTransfer(payload.data(), payload.size(), td))
+            {
+                // Update the shared player cache with the v2 data
+                SharedPlayerState state;
+                state.guid        = td.guid;
+                state.accountId   = td.accountId;
+                state.mapId       = td.mapId;
+                state.zoneId      = td.zoneId;
+                state.areaId      = td.areaId;
+                state.posX        = td.posX;
+                state.posY        = td.posY;
+                state.posZ        = td.posZ;
+                state.posO        = td.orientation;
+                state.health      = td.health;
+                state.maxHealth   = td.maxHealth;
+                state.powerType   = td.powerType;
+                state.power       = td.power;
+                state.maxPower    = td.maxPower;
+                state.level       = static_cast<uint8>(td.level);
+                state.active      = true;
+                if (td.transport.onTransport)
+                {
+                    state.transportEntry = td.transport.entry;
+                    state.transOffX = td.transport.offsetX;
+                    state.transOffY = td.transport.offsetY;
+                    state.transOffZ = td.transport.offsetZ;
+                    state.transOffO = td.transport.offsetO;
+                }
+                if (td.pet.hasPet)
+                {
+                    state.petEntry  = td.pet.entry;
+                    state.petHealth = td.pet.health;
+                    state.petMana   = td.pet.mana;
+                    state.petName   = td.pet.name;
+                }
+                state.lastUpdateMs = getMSTime();
+                sSharedPlayerCache.StoreFullState(std::move(state));
+            }
+            break;
+        }
+        case MSG_PLAYER_STATE_DELTA:
+        {
+            uint64 guid;
+            uint8 mask;
+            SharedPlayerState delta;
+            if (DeserializeStateDelta(payload.data(), static_cast<int>(payload.size()), guid, mask, delta))
+                sSharedPlayerCache.ApplyDelta(guid, mask, delta);
+            break;
+        }
+        case MSG_PLAYER_STATE_FULL:
+        {
+            SharedPlayerState state;
+            if (DeserializeFullState(payload.data(), static_cast<int>(payload.size()), state))
+            {
+                TC_LOG_DEBUG("server.worldserver", "NatsBus: Received full state for GUID {:016X} from node {}", state.guid, state.ownerNodeId);
+                sSharedPlayerCache.StoreFullState(std::move(state));
+            }
+            break;
+        }
+        case MSG_PLAYER_CLAIM:
+        {
+            if (payload.size() >= 9)
+            {
+                uint64 guid = 0;
+                for (int i = 0; i < 8; ++i) guid |= uint64(payload[i]) << (i * 8);
+                uint8 claimingNode = payload[8];
+
+                sSharedPlayerCache.UpdateFromPlayer(guid, [claimingNode](SharedPlayerState& s) {
+                    s.ownerNodeId = claimingNode;
+                });
+
+                TC_LOG_INFO("server.worldserver", "NatsBus: Node {} claimed GUID {:016X}", claimingNode, guid);
+                sClusterMgr.SetPlayerOwner(guid, claimingNode);
+
+                // If we own this player locally and another node is claiming it,
+                // queue deactivation for the world update thread
+                if (claimingNode != _nodeId)
+                {
+                    if (Player* player = ObjectAccessor::FindPlayer(GuidFromRaw(guid)))
+                    {
+                        TC_LOG_INFO("server.worldserver", "NatsBus: Local player GUID {:016X} claimed by node {} -- queueing deactivation", guid, claimingNode);
+                        sWorld->QueuePlayerDeactivation(guid);
+                    }
+                }
+            }
+            break;
+        }
+        case MSG_PLAYER_RELEASE:
+        {
+            if (payload.size() >= 9)
+            {
+                uint64 guid = 0;
+                for (int i = 0; i < 8; ++i) guid |= uint64(payload[i]) << (i * 8);
+                uint8 releasingNode = payload[8];
+
+                sSharedPlayerCache.UpdateFromPlayer(guid, [](SharedPlayerState& s) {
+                    s.active = false;
+                });
+
+                TC_LOG_INFO("server.worldserver", "NatsBus: Node {} released GUID {:016X}", releasingNode, guid);
+                sClusterMgr.SetPlayerOwner(guid, 0);
+            }
+            break;
+        }
+        case MSG_REDIRECT_TOKEN:
+        {
+            if (payload.size() >= 17)
+            {
+                ClusterMgr::PendingRedirect pr;
+                std::memcpy(&pr.accountId, payload.data(), 4);
+                std::memcpy(&pr.token, payload.data() + 4, 4);
+                pr.playerGuid = 0;
+                for (int i = 0; i < 8; ++i) pr.playerGuid |= uint64(payload[8 + i]) << (i * 8);
+                pr.sourceNodeId = payload[16];
+                pr.timestampMs = getMSTime();
+
+                // Deserialize addon list if present
+                size_t off = 17;
+                if (payload.size() >= 19)
+                {
+                    uint16 cnt = payload[off] | (uint16(payload[off+1]) << 8);
+                    off += 2;
+                    for (uint16 i = 0; i < cnt && off < payload.size(); ++i)
+                    {
+                        uint8 nLen = payload[off++];
+                        if (off + nLen + 7 > payload.size()) break;
+                        std::string name(reinterpret_cast<char const*>(payload.data() + off), nLen);
+                        off += nLen;
+                        uint8 enabled = payload[off++];
+                        uint32 crc = 0;
+                        std::memcpy(&crc, payload.data() + off, 4); off += 4;
+                        uint8 state = payload[off++];
+                        bool usePK = payload[off++] != 0;
+                        pr.addons.emplace_back(std::move(name), enabled, crc, state, usePK);
+                    }
+                }
+
+                // Trailing client IP binding: [ipLen:1][ip:n]
+                if (off < payload.size())
+                {
+                    uint8 ipLen = payload[off++];
+                    if (off + ipLen <= payload.size())
+                        pr.clientIp.assign(reinterpret_cast<char const*>(payload.data() + off), ipLen);
+                }
+
+                sClusterMgr.StorePendingRedirect(pr.accountId, std::move(pr));
+            }
+            break;
+        }
+        default:
+            TC_LOG_WARN("server.worldserver", "NatsBus: Unknown incoming msgType 0x{:02X}", msgType);
+            break;
+    }
+}
+
+// ── Incoming message handlers ─────────────────────────────────────────────────
+
+void NatsBus::HandleRemotePlayerOnline(std::vector<uint8> const& payload)
+{
+    // Payload: guid(8) + nameLen(1) + name[nameLen] + zone(4) + level + class + race + team + nodeId
+    if (payload.size() < 9)
+        return;
+
+    uint64 guid;
+    std::memcpy(&guid, payload.data(), 8);
+    uint8 nameLen = payload[8];
+
+    if (payload.size() < static_cast<std::size_t>(18) + nameLen)
+        return;
+
+    std::string name(reinterpret_cast<char const*>(payload.data() + 9), nameLen);
+    std::size_t off = 9 + nameLen;
+
+    uint32 zoneId;
+    std::memcpy(&zoneId, payload.data() + off, 4);
+    off += 4;
+
+    uint8 level   = payload[off + 0];
+    uint8 classId = payload[off + 1];
+    uint8 raceId  = payload[off + 2];
+    uint8 teamId  = payload[off + 3];
+    uint8 nodeId  = payload[off + 4];
+
+    // Ignore broadcasts about our own players — NATS delivers cluster.broadcast
+    // to ALL subscribers including the sender's node, so we'd otherwise kick our
+    // own freshly-logged-in players as "ghost sessions from another node".
+    if (nodeId == _nodeId)
+        return;
+
+    TC_LOG_INFO("server.worldserver", "NatsBus: Remote player ONLINE  GUID {:016X} '{}' node={}",
+             guid, name, nodeId);
+
+    sClusterMgr.OnRemotePlayerOnline(guid, std::move(name),
+                                      zoneId, level, classId, raceId, teamId, nodeId);
+
+    uint64 const remoteGuid   = guid;
+    uint32 const remoteZoneId = zoneId;
+    uint8  const remoteLevel  = level;
+    uint8  const remoteClass  = classId;
+
+    sWorld->QueueCallback([remoteGuid, remoteZoneId, remoteLevel, remoteClass]()
+    {
+        // Cross-node session cleanup: kick any stale session for this GUID.
+        // Not the session that just redirected this player out: the client is
+        // mid-switch and still holds that connection open. Closing it here
+        // is what the client sees as a disconnect. It goes away on its own
+        // when the client closes it (WorldSession::Update drops the session
+        // once its socket is gone).
+        if (Player* ghost = ObjectAccessor::FindConnectedPlayer(GuidFromRaw(remoteGuid)))
+            if (WorldSession* s = ghost->GetSession(); s && !s->IsRedirectedOut())
+                s->KickPlayer("cross-node reconnect");
+
+        // Friend notification: tell local friends this player came online.
+        TC_LOG_DEBUG("server.worldserver", "NatsBus: NotifyRemoteFriendOnline {:016X} zone={} level={} class={} ignored (phase 2 feature not ported)",
+                     remoteGuid, remoteZoneId, remoteLevel, remoteClass);
+    });
+}
+
+void NatsBus::HandleRemotePlayerOffline(uint64 guid)
+{
+    TC_LOG_INFO("server.worldserver", "NatsBus: Remote player OFFLINE GUID {:016X}", guid);
+    sClusterMgr.OnRemotePlayerOffline(guid);
+
+    // Clean up transfer and state cache for logged-off player
+    sSharedPlayerCache.Remove(guid);
+
+    // Friend notification: tell local players who have this remote player as a
+    // friend that they have gone offline.
+    sWorld->QueueCallback([guid]()
+    {
+        TC_LOG_DEBUG("server.worldserver", "NatsBus: NotifyRemoteFriendOffline {:016X} ignored (phase 2 feature not ported)", guid);
+    });
+}
+
+// ── Instance address query ────────────────────────────────────────────────────
+
+bool NatsBus::QueryBestInstanceAddress(std::string& outAddr, uint16& outPort)
+{
+    // Look up the instance node from our local routing table (populated by cluster.announce).
+    uint8 instanceNodeId = sClusterMgr.GetInstanceNodeId();
+    if (instanceNodeId == 0)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: QueryBestInstanceAddress — no instance node registered");
+        return false;
+    }
+
+    auto nodeInfo = sClusterMgr.GetNodeInfo(instanceNodeId);
+    if (!nodeInfo)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: QueryBestInstanceAddress — no info for instance nodeId={}", instanceNodeId);
+        return false;
+    }
+
+    outAddr = nodeInfo->address;
+    outPort = nodeInfo->port;
+    return true;
+}
+
+// ── Periodic updates (MSG_NODE_STATUS / MSG_NODE_REFRESH) ────────────────────
+
+
+// ── Shared Player State NATS methods ──────────────────────────────────────────
+
+void NatsBus::BroadcastPlayerStateDelta(uint64 guid, uint8 fieldMask)
+{
+    if (!_nc || !_connected) return;
+    auto state = sSharedPlayerCache.Get(guid);
+    if (!state) return;
+
+    std::vector<uint8> payload = SerializeStateDelta(guid, fieldMask, *state);
+    PublishBroadcast(MSG_PLAYER_STATE_DELTA, payload.data(), static_cast<int>(payload.size()));
+}
+
+void NatsBus::BroadcastPlayerStateFull(uint64 guid)
+{
+    if (!_nc || !_connected) return;
+    auto state = sSharedPlayerCache.Get(guid);
+    if (!state) return;
+
+    std::vector<uint8> payload = SerializeFullState(*state);
+    PublishBroadcast(MSG_PLAYER_STATE_FULL, payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: Broadcast full state for GUID {:016X} ({} bytes)", guid, payload.size());
+}
+
+void NatsBus::ClaimPlayer(uint64 guid)
+{
+    if (!_nc || !_connected) return;
+
+    uint8 payload[9];
+    for (int i = 0; i < 8; ++i) payload[i] = static_cast<uint8>((guid >> (i * 8)) & 0xFF);
+    payload[8] = _nodeId;
+
+    PublishBroadcast(MSG_PLAYER_CLAIM, payload, 9);
+    TC_LOG_INFO("server.worldserver", "NatsBus: Claiming ownership of GUID {:016X} for node {}", guid, _nodeId);
+}
+
+void NatsBus::ReleasePlayer(uint64 guid)
+{
+    if (!_nc || !_connected) return;
+
+    uint8 payload[9];
+    for (int i = 0; i < 8; ++i) payload[i] = static_cast<uint8>((guid >> (i * 8)) & 0xFF);
+    payload[8] = _nodeId;
+
+    PublishBroadcast(MSG_PLAYER_RELEASE, payload, 9);
+    TC_LOG_INFO("server.worldserver", "NatsBus: Releasing ownership of GUID {:016X} from node {}", guid, _nodeId);
+}
+
+void NatsBus::PublishRedirectToken(uint32 accountId, uint64 playerGuid, uint32 token,
+                                        uint8 destNodeId, std::string const& clientIp,
+                                        std::list<ClusterAddonInfo> const& addons)
+{
+    if (!_nc || !_connected) return;
+
+    // Wire: [accountId:4][token:4][guid:8][sourceNodeId:1] = 17 base
+    //   + [addonCount:2] + per-addon: [nameLen:1][name][enabled:1][crc:4][state:1][usePubKey:1]
+    //   + [clientIpLen:1][clientIp:n]   (appended last; absent = no IP binding)
+    std::vector<uint8> payload;
+    payload.resize(17);
+    std::memcpy(payload.data(), &accountId, 4);
+    std::memcpy(payload.data() + 4, &token, 4);
+    for (int i = 0; i < 8; ++i)
+        payload[8 + i] = static_cast<uint8>((playerGuid >> (i * 8)) & 0xFF);
+    payload[16] = _nodeId;
+
+    uint16 addonCount = static_cast<uint16>(addons.size());
+    payload.push_back(static_cast<uint8>(addonCount & 0xFF));
+    payload.push_back(static_cast<uint8>(addonCount >> 8));
+    for (auto const& a : addons)
+    {
+        uint8 nameLen = static_cast<uint8>(std::min<size_t>(a.Name.size(), 255));
+        payload.push_back(nameLen);
+        payload.insert(payload.end(), a.Name.begin(), a.Name.begin() + nameLen);
+        payload.push_back(a.Enabled);
+        uint32 crc = a.CRC;
+        payload.insert(payload.end(), reinterpret_cast<uint8*>(&crc),
+                       reinterpret_cast<uint8*>(&crc) + 4);
+        payload.push_back(a.State);
+        payload.push_back(a.UsePublicKeyOrCRC ? 1 : 0);
+    }
+
+    uint8 const ipLen = static_cast<uint8>(std::min<size_t>(clientIp.size(), 255));
+    payload.push_back(ipLen);
+    payload.insert(payload.end(), clientIp.begin(), clientIp.begin() + ipLen);
+
+    // Destination only. The 3.3.5a client does not echo the token back in
+    // CMSG_AUTH_CONTINUED_SESSION, so the pending entry itself is the
+    // credential — every extra node holding it is another place a stray
+    // reconnect could be handed this player's session.
+    PublishToNode(destNodeId, MSG_REDIRECT_TOKEN,
+                  payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Published redirect token for account {} GUID {:016X} -> node {} "
+             "(token=0x{:08X}, {} addons, client {})",
+             accountId, playerGuid, destNodeId, token, addonCount, clientIp);
+}
+
+void NatsBus::RefreshConfigCache()
+{
+    // Defaults mirror the historical inline sConfigMgr->GetOption calls exactly.
+    // NOTE: HeartbeatInterval intentionally drives BOTH the heartbeat send and
+    // the dead-node check interval, as it did before this caching change.
+    _heartbeatIntervalMs   = sConfigMgr->GetIntDefault("ClusterServer.HeartbeatInterval", 300);
+    _nodeDeadTimeoutMs     = sConfigMgr->GetIntDefault("ClusterServer.NodeDeadTimeout", 3000);
+    _mgmtStatusIntervalMs  = static_cast<uint32>(sConfigMgr->GetIntDefault("ClusterServer.MgmtStatusInterval", 5)) * 1000u;
+    _mgmtPlayersIntervalMs = static_cast<uint32>(sConfigMgr->GetIntDefault("ClusterServer.MgmtPlayersInterval", 3)) * 1000u;
+    _lfgMasterNodeId       = static_cast<uint8>(sConfigMgr->GetIntDefault("ClusterServer.LFGMasterNode", 1));
+}
+
+void NatsBus::Update()
+{
+    constexpr uint32 NATS_RETRY_INTERVAL_MS     = 10 * 1000;    //  10 seconds
+    constexpr uint32 ANNOUNCE_RETRY_INTERVAL_MS = 10 * 1000;    //  10 seconds
+    uint32 const HEARTBEAT_INTERVAL_MS = _heartbeatIntervalMs;
+    constexpr uint32 REFRESH_INTERVAL_MS        = 5 * 60 * 1000; //  5 minutes
+
+    uint32 now = getMSTime();
+
+    if (!_connected)
+    {
+        // Retry NATS connection every 10 seconds.
+        if (now - _lastNatsRetryMs >= NATS_RETRY_INTERVAL_MS)
+        {
+            _lastNatsRetryMs = now;
+            if (ConnectNATS())
+            {
+                TC_LOG_INFO("server.worldserver",
+                         "NatsBus: Reconnected to NATS as node {}", _nodeId);
+                PublishAnnounce();
+                _lastAnnounceRetryMs = now;
+            }
+        }
+        return;
+    }
+
+    // Don't announce until world is ready.
+    if (!_worldReady)
+        return;
+
+    // cnats recovered the connection on its own (OnNatsReconnected). Peers may
+    // have marked us dead in the meantime, so re-announce right away.
+    if (_reannouncePending.exchange(false))
+    {
+        PublishAnnounce();
+        _lastAnnounceRetryMs = now;
+        _lastPeriodicAnnounceMs = now;
+    }
+
+    if (!_clusterRegistered && now - _lastAnnounceRetryMs >= ANNOUNCE_RETRY_INTERVAL_MS)
+    {
+        _lastAnnounceRetryMs = now;
+        PublishAnnounce();
+        TC_LOG_INFO("server.worldserver",
+                 "NatsBus: Re-announcing to cluster (awaiting peer acknowledgement)");
+    }
+
+    // Periodic announce so late-joining nodes always learn our routing table
+    // within 60 seconds, regardless of the initial registration handshake.
+    constexpr uint32 PERIODIC_ANNOUNCE_INTERVAL_MS = 60 * 1000;
+    if (_lastPeriodicAnnounceMs == 0 || now - _lastPeriodicAnnounceMs >= PERIODIC_ANNOUNCE_INTERVAL_MS)
+    {
+        _lastPeriodicAnnounceMs = now;
+        PublishAnnounce();
+    }
+
+    if (now - _lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)
+    {
+        SendNodeStatus();
+        _lastHeartbeatMs = now;
+    }
+
+    if (_lastRefreshMs == 0 || now - _lastRefreshMs >= REFRESH_INTERVAL_MS)
+    {
+        SendNodeRefresh();
+        _lastRefreshMs = now;
+    }
+
+    // Periodic transport position broadcast for drift correction across nodes.
+    if (_transportSyncIntervalMs > 0 &&
+        now - _lastTransportSyncMs >= _transportSyncIntervalMs)
+    {
+        SendTransportSync();
+        _lastTransportSyncMs = now;
+    }
+
+    // Dead-node detection: check every heartbeat interval whether any known peer has gone silent.
+    uint32 const DEAD_CHECK_INTERVAL_MS = _heartbeatIntervalMs;
+    if (now - _lastDeadCheckMs >= DEAD_CHECK_INTERVAL_MS)
+    {
+        _lastDeadCheckMs = now;
+        uint32 deadThresholdMs = _nodeDeadTimeoutMs;
+
+        for (uint8 deadNodeId : sClusterMgr.GetStaleNodeIds(deadThresholdMs, now))
+            HandleNodeDead(deadNodeId);
+    }
+
+    // Management monitoring publishes (consumed by clustermgr).
+    uint32 mgmtStatusIntervalMs = _mgmtStatusIntervalMs;
+    if (mgmtStatusIntervalMs > 0 && now - _lastMgmtStatusMs >= mgmtStatusIntervalMs)
+    {
+        SendMgmtStatus();
+        _lastMgmtStatusMs = now;
+    }
+
+    uint32 mgmtPlayersIntervalMs = _mgmtPlayersIntervalMs;
+    if (mgmtPlayersIntervalMs > 0 && now - _lastMgmtPlayersMs >= mgmtPlayersIntervalMs)
+    {
+        SendMgmtPlayers();
+        _lastMgmtPlayersMs = now;
+    }
+}
+
+// ── Transport sync ────────────────────────────────────────────────────────────
+
+void NatsBus::OnTransportQueryMsg(natsConnection* /*nc*/, natsSubscription* /*sub*/,
+                                       natsMsg* msg, void* closure)
+{
+    auto* self = static_cast<NatsBus*>(closure);
+
+    // Called on NATS dispatch thread: build a reply with current PathProgress for
+    // every live Transport.  The caller (QueryTransportSync) is waiting with
+    // a 500 ms timeout.
+
+    // Authenticate the request. We also ignore our own request: this node is
+    // subscribed to the query subject too, and answering ourselves with an
+    // empty container would win the request-reply race against a real peer.
+    {
+        const uint8* raw = reinterpret_cast<const uint8*>(natsMsg_GetData(msg));
+        int rawLen       = natsMsg_GetDataLength(msg);
+        uint8 srcNodeId = 0, msgType = 0;
+        std::vector<uint8> unused;
+        bool const ok = ClusterAuth::Open(raw, static_cast<std::size_t>(rawLen), srcNodeId, msgType, unused);
+        if (!ok || msgType != MSG_TRANSPORT_QUERY || srcNodeId == self->_nodeId)
+        {
+            natsMsg_Destroy(msg);
+            return;
+        }
+    }
+
+    auto& container = HashMapHolder<Transport>::GetContainer();
+    std::shared_lock lock(*HashMapHolder<Transport>::GetLock());
+
+    // Wire: [count:2][guid_low:4][path_progress:4]...
+    uint16 const count = static_cast<uint16>(container.size());
+    std::vector<uint8> reply(2 + static_cast<std::size_t>(count) * 8);
+    std::memcpy(reply.data(), &count, 2);
+
+    uint16 idx = 0;
+    for (auto const& [guid, trans] : container)
+    {
+        uint32 guidLow  = guid.GetCounter();
+        uint32 progress = trans->GetTimer();
+        std::memcpy(reply.data() + 2 + idx * 8,     &guidLow,  4);
+        std::memcpy(reply.data() + 2 + idx * 8 + 4, &progress, 4);
+        ++idx;
+    }
+
+    char const* replySubj = natsMsg_GetReply(msg);
+    if (replySubj && replySubj[0] != '\0')
+        self->PublishSealed(replySubj, MSG_TRANSPORT_REPLY, reply.data(), reply.size());
+    natsMsg_Destroy(msg);
+}
+
+std::unordered_map<uint32, uint32> NatsBus::QueryTransportSync()
+{
+    std::unordered_map<uint32, uint32> result;
+    if (!_nc || !_connected)
+        return result;
+
+    // Sealed empty request; 500 ms timeout.
+    std::vector<uint8> req = ClusterAuth::Seal(_nodeId, MSG_TRANSPORT_QUERY, nullptr, 0);
+    if (req.empty())
+        return result;
+
+    natsMsg* reply = nullptr;
+    natsStatus s = natsConnection_Request(&reply, _nc, "cluster.transport.query",
+                                          req.data(), static_cast<int>(req.size()), 500);
+    if (s == NATS_TIMEOUT)
+    {
+        // No peer responded — this is the first node, or peers aren't up yet.
+        return result;
+    }
+    if (s != NATS_OK)
+    {
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus::QueryTransportSync — NATS request failed: {}",
+                 natsStatus_GetText(s));
+        return result;
+    }
+
+    // Authenticate the reply, then parse [count:2][guid_low:4][path_progress:4]...
+    uint8 srcNodeId = 0, msgType = 0;
+    std::vector<uint8> body;
+    bool const ok = ClusterAuth::Open(reinterpret_cast<uint8 const*>(natsMsg_GetData(reply)),
+                                      static_cast<std::size_t>(natsMsg_GetDataLength(reply)),
+                                      srcNodeId, msgType, body);
+    if (!ok || msgType != MSG_TRANSPORT_REPLY)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus::QueryTransportSync — dropped unauthenticated reply");
+        natsMsg_Destroy(reply);
+        return result;
+    }
+
+    if (body.size() >= 2)
+    {
+        uint8 const* p   = body.data();
+        uint8 const* end = p + body.size();
+        uint16 count;
+        std::memcpy(&count, p, 2);
+        p += 2;
+        for (uint16 i = 0; i < count && p + 8 <= end; ++i, p += 8)
+        {
+            uint32 guidLow, progress;
+            std::memcpy(&guidLow,  p,     4);
+            std::memcpy(&progress, p + 4, 4);
+            result[guidLow] = progress;
+        }
+    }
+
+    natsMsg_Destroy(reply); // caller owns the reply from natsConnection_Request
+    return result;
+}
+
+void NatsBus::SendTransportSync()
+{
+    auto& container = HashMapHolder<Transport>::GetContainer();
+    std::shared_lock lock(*HashMapHolder<Transport>::GetLock());
+    if (container.empty())
+        return;
+
+    uint16 const count = static_cast<uint16>(container.size());
+    std::vector<uint8> payload(2 + static_cast<std::size_t>(count) * 8);
+    std::memcpy(payload.data(), &count, 2);
+
+    uint16 idx = 0;
+    for (auto const& [guid, trans] : container)
+    {
+        uint32 guidLow  = guid.GetCounter();
+        uint32 progress = trans->GetTimer();
+        std::memcpy(payload.data() + 2 + idx * 8,     &guidLow,  4);
+        std::memcpy(payload.data() + 2 + idx * 8 + 4, &progress, 4);
+        ++idx;
+    }
+
+    PublishBroadcast(MSG_TRANSPORT_SYNC, payload.data(), static_cast<int>(payload.size()));
+    TC_LOG_DEBUG("server.worldserver",
+              "NatsBus: Sent transport sync for {} transport(s)", idx);
+}
+
+void NatsBus::HandleTransportSync(std::vector<uint8> const& payload)
+{
+    if (payload.size() < 2)
+        return;
+
+    uint16 count;
+    std::memcpy(&count, payload.data(), 2);
+    if (payload.size() < static_cast<std::size_t>(2 + count * 8))
+        return;
+
+    for (uint16 i = 0; i < count; ++i)
+    {
+        uint32 guidLow, remoteProgress;
+        std::memcpy(&guidLow,        payload.data() + 2 + i * 8,     4);
+        std::memcpy(&remoteProgress, payload.data() + 2 + i * 8 + 4, 4);
+
+        ObjectGuid guid = ObjectGuid::Create<HighGuid::Mo_Transport>(guidLow);
+        Transport* trans = HashMapHolder<Transport>::Find(guid);
+        if (!trans)
+            continue;
+
+        uint32 const period = trans->GetTransportPeriod();
+        if (period == 0)
+            continue;
+
+        uint32 const localProgress = trans->GetTimer();
+
+        // Compute the circular distance between local and remote progress.
+        // Take the shorter arc so wrap-around doesn't cause false corrections.
+        uint32 fwd = (remoteProgress >= localProgress)
+            ? remoteProgress - localProgress
+            : period - (localProgress - remoteProgress);
+        uint32 const diff = (fwd <= period / 2) ? fwd : period - fwd;
+
+        if (diff > 2000)
+        {
+            trans->InitializeToTime(remoteProgress);
+            TC_LOG_DEBUG("server.worldserver",
+                      "NatsBus: Transport {:08X} synced: local={} remote={} drift={}ms",
+                      guidLow, localProgress, remoteProgress, diff);
+        }
+    }
+}
+
+// ── RA command execution helpers ──────────────────────────────────────────────
+
+struct RACommandState
+{
+    uint32      reqId;
+    std::string output;
+};
+
+static void RACommandPrint(void* arg, std::string_view text)
+{
+    static_cast<RACommandState*>(arg)->output.append(text);
+}
+
+static void RACommandFinished(void* arg, bool /*success*/)
+{
+    auto* state = static_cast<RACommandState*>(arg);
+    sNatsBus.SendRAReply(state->reqId, state->output);
+    delete state;
+}
+
+void NatsBus::HandleRACommand(uint32 reqId, std::string const& cmd)
+{
+    // RAII ownership: if the CliCommandHolder ctor throws, unique_ptr frees the
+    // state. On success, ownership passes to RACommandFinished (which deletes it
+    // exactly once) via the CLI callback chain, so we release() here.
+    auto state = std::make_unique<RACommandState>();
+    state->reqId = reqId;
+    auto* holder = new CliCommandHolder(state.get(), cmd.c_str(), RACommandPrint, RACommandFinished);
+    sWorld->QueueCliCommand(holder);
+    state.release();
+}
+
+void NatsBus::SendRAReply(uint32 reqId, std::string const& output)
+{
+    if (!_connected || !_nc)
+        return;
+    uint16 outLen = static_cast<uint16>(std::min(output.size(), size_t(65535)));
+    std::vector<uint8> data;
+    data.reserve(1 + 1 + 4 + 2 + outLen);
+    data.push_back(_nodeId);
+    data.push_back(MSG_RA_REPLY);
+    data.push_back(static_cast<uint8>(reqId & 0xFF));
+    data.push_back(static_cast<uint8>((reqId >> 8)  & 0xFF));
+    data.push_back(static_cast<uint8>((reqId >> 16) & 0xFF));
+    data.push_back(static_cast<uint8>((reqId >> 24) & 0xFF));
+    data.push_back(static_cast<uint8>(outLen & 0xFF));
+    data.push_back(static_cast<uint8>(outLen >> 8));
+    data.insert(data.end(), output.begin(), output.begin() + outLen);
+    PublishRaw("cluster.proxy", data.data(), static_cast<int>(data.size()));
+}
+
+// ── Node health / failover ────────────────────────────────────────────────────
+
+void NatsBus::HandleNodeStatus(std::vector<uint8> const& payload)
+{
+    // Wire: [nodeId:1][playerCount:4][natsBytesTx:4][natsBytesRx:4] = 13 bytes
+    if (payload.size() < 13)
+        return;
+
+    uint8 srcNodeId = payload[0];
+    if (srcNodeId == _nodeId)
+        return;  // our own broadcast — ignore
+
+    uint32 playerCount;
+    std::memcpy(&playerCount, payload.data() + 1, 4);
+    // natsBytesTx/Rx at +5/+9 — not used for failover, ignore
+
+    uint32 nowMs = getMSTime();
+    bool wasRevived = sClusterMgr.UpdateNodeStatus(srcNodeId, playerCount, nowMs);
+    if (wasRevived)
+        RestoreBgCoordIfNeeded(srcNodeId);
+}
+
+void NatsBus::HandleNodeDead(uint8 deadNodeId)
+{
+    auto orphanedMaps = sClusterMgr.MarkNodeDead(deadNodeId);
+
+    TC_LOG_WARN("server.worldserver",
+             "NatsBus: Node {} declared DEAD (missed heartbeats). Orphaned {} map(s).",
+             deadNodeId, orphanedMaps.size());
+
+    // Elect a new BG coordinator if the dead node held that role.
+    // Lowest alive non-instance nodeId wins — deterministic, no consensus needed.
+    if (deadNodeId == _bgCoordNodeId)
+    {
+        uint8 newCoord = sClusterMgr.GetLowestAliveNonInstanceNodeId();
+        // If no peer qualifies, this node takes over.
+        if (newCoord == 0)
+            newCoord = _nodeId;
+        _bgCoordNodeId = newCoord;
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus: BG coordinator was node {} (dead). Elected new coordinator: node {}.",
+                 deadNodeId, _bgCoordNodeId);
+    }
+
+    // Track cluster instability for management monitoring.
+    if (_nodeCrashCount < 65535u)
+        ++_nodeCrashCount;
+
+    // Broadcast so all surviving peer nodes update their routing tables.
+    uint8 deadPayload[1] = { deadNodeId };
+    PublishBroadcast(MSG_NODE_DEAD, deadPayload, 1);
+
+    // Failover: claim orphaned maps from the dead node so players can still
+    // reach those zones. The proxy will route to us after re-announce.
+    if (!orphanedMaps.empty() && !sClusterMgr.IsInstanceServerMode())
+    {
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus: Claiming {} orphaned maps from dead node {}",
+                 orphanedMaps.size(), deadNodeId);
+        sClusterMgr.ClaimOrphanedMaps(deadNodeId);
+    }
+
+    // Clear stale online flags for characters that were on the dead node.
+    // Without this, those characters remain online=1 forever and block re-login.
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_NODE_ONLINE_CLEANUP);
+    stmt->setUInt8(0, deadNodeId);
+    CharacterDatabase.Execute(stmt);
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Cleared online flags for characters owned by dead node {}.", deadNodeId);
+}
+
+void NatsBus::HandleNodeDeadMsg(std::vector<uint8> const& payload)
+{
+    if (payload.empty())
+        return;
+
+    uint8 deadNodeId = payload[0];
+    if (deadNodeId == _nodeId)
+        return;
+
+    auto orphanedMaps = sClusterMgr.MarkNodeDead(deadNodeId);
+
+    TC_LOG_WARN("server.worldserver",
+             "NatsBus: Received MSG_NODE_DEAD for node {}. Orphaned {} map(s).",
+             deadNodeId, orphanedMaps.size());
+
+    // Failover: elect this node to claim orphaned maps based on lowest nodeId
+    if (!orphanedMaps.empty() && !sClusterMgr.IsInstanceServerMode())
+    {
+        uint8 lowestAlive = sClusterMgr.GetLowestAliveNonInstanceNodeId();
+        if (lowestAlive == 0 || lowestAlive == _nodeId)
+        {
+            TC_LOG_WARN("server.worldserver",
+                     "NatsBus: This node (id {}) elected to claim {} orphaned maps from dead node {}",
+                     _nodeId, orphanedMaps.size(), deadNodeId);
+            sClusterMgr.ClaimOrphanedMaps(deadNodeId);
+        }
+        else
+        {
+            TC_LOG_INFO("server.worldserver",
+                     "NatsBus: Node {} will claim maps from dead node {} (lower nodeId)",
+                     lowestAlive, deadNodeId);
+        }
+    }
+
+    if (deadNodeId == _bgCoordNodeId)
+    {
+        uint8 newCoord = sClusterMgr.GetLowestAliveNonInstanceNodeId();
+        if (newCoord == 0)
+            newCoord = _nodeId;
+        _bgCoordNodeId = newCoord;
+        TC_LOG_WARN("server.worldserver",
+                 "NatsBus: BG coordinator was node {} (dead). Elected new coordinator: node {}.",
+                 deadNodeId, _bgCoordNodeId);
+    }
+}
+
+void NatsBus::RestoreBgCoordIfNeeded(uint8 revivedNodeId)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: RestoreBgCoordIfNeeded ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendNodeStatus()
+{
+    uint32 playerCount = static_cast<uint32>(sWorld->GetActiveSessionCount());
+    // Delta since the previous heartbeat against a monotonic counter (no reset),
+    // so the mgmt-status consumer is not disturbed. Unsigned wraparound yields
+    // the correct delta across the ~49-day uint32 rollover.
+    uint32 totalTx = _natsBytesTx.load(std::memory_order_relaxed);
+    uint32 totalRx = _natsBytesRx.load(std::memory_order_relaxed);
+    uint32 natsBytesTx = totalTx - _hbLastBytesTx;
+    uint32 natsBytesRx = totalRx - _hbLastBytesRx;
+    _hbLastBytesTx = totalTx;
+    _hbLastBytesRx = totalRx;
+
+    // Wire: [nodeId:1][playerCount:4][natsBytesTx:4][natsBytesRx:4] = 13 bytes
+    // nodeId is prepended so receiving nodes know which peer sent this heartbeat.
+    uint8 payload[13];
+    payload[0] = _nodeId;
+    std::memcpy(payload + 1, &playerCount, 4);
+    std::memcpy(payload + 5, &natsBytesTx, 4);
+    std::memcpy(payload + 9, &natsBytesRx, 4);
+
+    PublishBroadcast(MSG_NODE_STATUS, payload, 13);
+    TC_LOG_DEBUG("server.worldserver",
+              "NatsBus: Sent NODE_STATUS players={} nats_tx={}B nats_rx={}B",
+              playerCount, natsBytesTx, natsBytesRx);
+}
+
+void NatsBus::SendNodeRefresh()
+{
+    // Re-announce identity so late-joining peer nodes can build routing tables.
+    PublishAnnounce();
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Sent node re-announce (port={} nodeId={})", _gamePort, _nodeId);
+}
+
+// ── Management monitoring publishes (cluster.mgmt.*) ─────────────────────────
+
+void NatsBus::PublishRaw(std::string const& subject, uint8 const* data, int len)
+{
+    if (!_nc)
+        return;
+    natsStatus s = natsConnection_Publish(_nc, subject.c_str(), data, len);
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus: PublishRaw to {} failed — {}",
+                 subject, natsStatus_GetText(s));
+    else
+        _natsBytesTx.fetch_add(static_cast<uint32>(len), std::memory_order_relaxed);
+}
+
+#ifndef _WIN32
+/// Read VmRSS from /proc/self/status in MB.
+static uint32 ReadMemUsageMB()
+{
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+    {
+        if (line.rfind("VmRSS:", 0) == 0)
+        {
+            uint32 kb = 0;
+            std::sscanf(line.c_str(), "VmRSS: %u", &kb);
+            return kb / 1024u;
+        }
+    }
+    return 0;
+}
+
+/// Compute CPU% from /proc/self/stat delta between calls.
+/// lastJiffies and lastCheckMs are persistent across calls (stored in NatsBus).
+static uint8 ComputeCpuPercent(uint32& lastJiffies, uint32& lastCheckMs)
+{
+    // /proc/self/stat fields: pid(1) comm(2) state(3) ... utime(14) stime(15)
+    std::ifstream f("/proc/self/stat");
+    if (!f)
+        return 0;
+
+    std::string token;
+    unsigned long utime = 0, stime = 0;
+    // Skip fields 1-13 by reading tokens; field 2 (comm) may contain spaces
+    // inside parens so read whole line and parse from the end of the ')'
+    std::string line;
+    std::getline(f, line);
+    f.close();
+
+    // Find end of comm field — last ')'
+    auto rp = line.rfind(')');
+    if (rp == std::string::npos)
+        return 0;
+
+    // Fields after ')': state ppid pgrp session tty_nr tpgid flags
+    //   minflt cminflt majflt cmajflt utime stime   (12 more tokens)
+    std::istringstream ss(line.substr(rp + 1));
+    std::string skip;
+    for (int i = 0; i < 11; ++i)
+        ss >> skip;          // state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+    ss >> utime >> stime;
+
+    uint32 totalJiffies = static_cast<uint32>(utime + stime);
+    uint32 now = getMSTime();
+
+    if (lastJiffies == 0 || lastCheckMs == 0)
+    {
+        lastJiffies  = totalJiffies;
+        lastCheckMs  = now;
+        return 0;
+    }
+
+    uint32 diffJiffies = totalJiffies - lastJiffies;
+    uint32 diffMs      = now - lastCheckMs;
+    lastJiffies        = totalJiffies;
+    lastCheckMs        = now;
+
+    if (diffMs == 0)
+        return 0;
+
+    // Linux HZ = 100: each jiffy is 10ms.
+    // cpu% = (diffJiffies * 10ms) / diffMs * 100
+    uint32 pct = diffJiffies * 1000u / diffMs;
+    return static_cast<uint8>(std::min(pct, 100u));
+}
+#else
+static uint32 ReadMemUsageMB() { return 0; }
+static uint8 ComputeCpuPercent(uint32& /*lastJiffies*/, uint32& /*lastCheckMs*/) { return 0; }
+#endif
+
+void NatsBus::SendMgmtStatus()
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Collect metrics.
+    uint32 playerCount = static_cast<uint32>(sWorld->GetPlayerCount());
+    uint32 maxPlayers  = static_cast<uint32>(sWorld->GetPlayerAmountLimit());
+#ifndef _WIN32
+    uint32 pid         = static_cast<uint32>(::getpid());
+#else
+    uint32 pid         = 0;
+#endif
+    uint32 uptimeSecs  = (getMSTime() - _startupTimeMs) / 1000u;
+    uint32 memUsageMB  = ReadMemUsageMB();
+    uint8  cpuPercent  = ComputeCpuPercent(_lastCpuJiffies, _lastCpuCheckMs);
+    // True bytes/sec: delta against this consumer's own snapshot over the actual
+    // elapsed interval (not a hard-coded /10). Independent of the heartbeat.
+    uint32 nowBpsMs    = getMSTime();
+    uint32 totalTxB    = _natsBytesTx.load(std::memory_order_relaxed);
+    uint32 totalRxB    = _natsBytesRx.load(std::memory_order_relaxed);
+    uint32 elapsedMs   = nowBpsMs - _mgmtRateLastMs;
+    uint32 natsTxBps   = (_mgmtRateLastMs != 0 && elapsedMs > 0)
+                         ? (totalTxB - _mgmtLastBytesTx) * 1000u / elapsedMs : 0u;
+    uint32 natsRxBps   = (_mgmtRateLastMs != 0 && elapsedMs > 0)
+                         ? (totalRxB - _mgmtLastBytesRx) * 1000u / elapsedMs : 0u;
+    _mgmtLastBytesTx   = totalTxB;
+    _mgmtLastBytesRx   = totalRxB;
+    _mgmtRateLastMs    = nowBpsMs;
+
+    // Maps list.
+    std::unordered_set<uint32> localMaps = sClusterMgr.GetLocalMaps();
+    uint8 mapCount = static_cast<uint8>(std::min(localMaps.size(), std::size_t(128)));
+
+    // Address string.
+    uint8 addrLen = static_cast<uint8>(std::min(_gameAddress.size(), std::size_t(255)));
+
+    // Wire format (fixed 30 bytes + mapCount*4 + 1 + addrLen):
+    // [nodeId:1][state:1][playerCount:2][maxPlayers:2][pid:4][uptimeSecs:4]
+    // [memUsageMB:4][cpuPercent:1][crashCount:2][natsTxBps:4][natsRxBps:4]
+    // [mapCount:1][mapIds:4×n][addrLen:1][addr:n]
+    std::size_t fixedLen = 1+1+2+2+4+4+4+1+2+4+4+1;  // 30 bytes
+    std::size_t totalLen = fixedLen + static_cast<std::size_t>(mapCount) * 4 + 1 + addrLen;
+    std::vector<uint8> buf(totalLen, 0);
+
+    std::size_t off = 0;
+    buf[off++] = _nodeId;
+    buf[off++] = 3;   // state = RUNNING (we only publish when alive)
+    uint16 pc16 = static_cast<uint16>(std::min(playerCount, 65535u));
+    uint16 mp16 = static_cast<uint16>(std::min(maxPlayers,  65535u));
+    std::memcpy(buf.data() + off, &pc16, 2);      off += 2;
+    std::memcpy(buf.data() + off, &mp16, 2);      off += 2;
+    std::memcpy(buf.data() + off, &pid, 4);        off += 4;
+    std::memcpy(buf.data() + off, &uptimeSecs, 4); off += 4;
+    std::memcpy(buf.data() + off, &memUsageMB, 4); off += 4;
+    buf[off++] = cpuPercent;
+    std::memcpy(buf.data() + off, &_nodeCrashCount, 2); off += 2;
+    std::memcpy(buf.data() + off, &natsTxBps, 4);  off += 4;
+    std::memcpy(buf.data() + off, &natsRxBps, 4);  off += 4;
+    buf[off++] = mapCount;
+    uint8 mIdx = 0;
+    for (uint32 mapId : localMaps)
+    {
+        if (mIdx >= mapCount) break;
+        std::memcpy(buf.data() + off, &mapId, 4);
+        off += 4;
+        ++mIdx;
+    }
+    buf[off++] = addrLen;
+    if (addrLen > 0)
+        std::memcpy(buf.data() + off, _gameAddress.data(), addrLen);
+
+    // Sealed: clustermgr verifies the tag before trusting node state, and the
+    // address field lands in the operator's browser — an unauthenticated feed
+    // let anyone on the NATS port invent nodes and inject markup.
+    PublishSealed("cluster.mgmt.status", MSG_MGMT_STATUS, buf.data(), totalLen);
+}
+
+void NatsBus::SendMgmtPlayers()
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Collect all online players' positions.
+    // World-thread only: iterates sWorld->GetAllSessions() (not mutex-protected in TC).
+    std::vector<uint8> buf;
+    buf.reserve(3 + 64 * 32);  // rough estimate
+
+    // Header: [nodeId:1][playerCount:2]
+    buf.push_back(_nodeId);
+    std::size_t countOff = buf.size();
+    buf.push_back(0);  // playerCount low byte — filled in below
+    buf.push_back(0);  // playerCount high byte
+
+    uint16 playerCount = 0;
+    for (auto const& [id, sess] : sWorld->GetAllSessions())
+    {
+        Player* player = sess->GetPlayer();
+        if (!player || !player->IsInWorld())
+            continue;
+
+        uint64 guid   = player->GetGUID().GetRawValue();
+        uint16 mapId  = static_cast<uint16>(player->GetMapId());
+        float  x      = player->GetPositionX();
+        float  y      = player->GetPositionY();
+        float  z      = player->GetPositionZ();
+        uint16 zoneId = static_cast<uint16>(player->GetZoneId());
+        uint8  level  = static_cast<uint8>(player->GetLevel());
+        uint8  cls    = player->GetClass();
+        uint8  race   = player->GetRace();
+        uint8  team   = static_cast<uint8>(player->GetTeamId());
+
+        std::string const& name = player->GetName();
+        uint8 nameLen = static_cast<uint8>(std::min(name.size(), std::size_t(48)));
+
+        // Per-player: guid(8)+mapId(2)+x(4)+y(4)+z(4)+zoneId(2)+level(1)+class(1)+race(1)+team(1)+nameLen(1)+name
+        std::size_t needed = 8+2+4+4+4+2+1+1+1+1+1 + nameLen;
+        std::size_t base   = buf.size();
+        buf.resize(base + needed);
+
+        std::size_t off = base;
+        std::memcpy(buf.data() + off, &guid,   8); off += 8;
+        std::memcpy(buf.data() + off, &mapId,  2); off += 2;
+        std::memcpy(buf.data() + off, &x,      4); off += 4;
+        std::memcpy(buf.data() + off, &y,      4); off += 4;
+        std::memcpy(buf.data() + off, &z,      4); off += 4;
+        std::memcpy(buf.data() + off, &zoneId, 2); off += 2;
+        buf[off++] = level;
+        buf[off++] = cls;
+        buf[off++] = race;
+        buf[off++] = team;
+        buf[off++] = nameLen;
+        if (nameLen > 0)
+            std::memcpy(buf.data() + off, name.data(), nameLen);
+
+        ++playerCount;
+    }
+
+    // Fill in actual count
+    std::memcpy(buf.data() + countOff, &playerCount, 2);
+
+    PublishSealed("cluster.mgmt.players", MSG_MGMT_PLAYERS, buf.data(), buf.size());
+}
+
+// ── Outgoing cluster messages ─────────────────────────────────────────────────
+
+void NatsBus::SendReroute(uint64 playerGuid, std::string const& address, uint16 port,
+                             uint32 mapId, float x, float y, float z, float ori)
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Wire format for cluster.proxy MSG_REROUTE_PLAYER:
+    //   [sourceNodeId:1][msgType:1][guid:8][addrLen:1][addr:n][port:2][map:4][x:4][y:4][z:4][ori:4]
+    // map/x/y/z/ori are always included; zeros mean login reroute (no native SMSG_NEW_WORLD needed).
+    uint8  addrLen = static_cast<uint8>(std::min(address.size(), std::size_t(255)));
+    uint16 portLE  = port;
+
+    std::vector<uint8> buf;
+    buf.reserve(2 + 8 + 1 + addrLen + 2 + 4 + 4 + 4 + 4 + 4);
+
+    // [sourceNodeId:1][msgType:1]
+    buf.push_back(_nodeId);
+    buf.push_back(MSG_REROUTE_PLAYER);
+
+    // [guid:8]
+    for (int i = 0; i < 8; ++i)
+        buf.push_back(static_cast<uint8>((playerGuid >> (i * 8)) & 0xFF));
+
+    // [addrLen:1][addr:n]
+    buf.push_back(addrLen);
+    buf.insert(buf.end(), address.begin(), address.begin() + addrLen);
+
+    // [port:2]
+    buf.push_back(static_cast<uint8>(portLE & 0xFF));
+    buf.push_back(static_cast<uint8>(portLE >> 8));
+
+    // [map:4]
+    buf.push_back(static_cast<uint8>(mapId & 0xFF));
+    buf.push_back(static_cast<uint8>((mapId >> 8) & 0xFF));
+    buf.push_back(static_cast<uint8>((mapId >> 16) & 0xFF));
+    buf.push_back(static_cast<uint8>((mapId >> 24) & 0xFF));
+
+    // [x:4][y:4][z:4][ori:4] — float little-endian
+    auto pushFloat = [&](float v) {
+        uint32 bits;
+        std::memcpy(&bits, &v, 4);
+        buf.push_back(static_cast<uint8>(bits & 0xFF));
+        buf.push_back(static_cast<uint8>((bits >> 8) & 0xFF));
+        buf.push_back(static_cast<uint8>((bits >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8>((bits >> 24) & 0xFF));
+    };
+    pushFloat(x);
+    pushFloat(y);
+    pushFloat(z);
+    pushFloat(ori);
+
+    natsStatus s = natsConnection_Publish(_nc, "cluster.proxy", buf.data(), static_cast<int>(buf.size()));
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus::SendReroute: publish failed — {}", natsStatus_GetText(s));
+    else
+    {
+        _natsBytesTx.fetch_add(static_cast<uint32>(buf.size()), std::memory_order_relaxed);
+        TC_LOG_INFO("server.worldserver",
+                 "NatsBus::SendReroute GUID {:016X} → {}:{} map={} pos=({:.1f},{:.1f},{:.1f},{:.2f})",
+                 playerGuid, address, port, mapId, x, y, z, ori);
+    }
+}
+
+void NatsBus::SendRerouteToMap(uint64 playerGuid, uint32 mapId)
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Payload: [sourceNodeId:1][msgType:1][guid:8][mapId:4]
+    uint8 buf[14];
+    buf[0] = _nodeId;
+    buf[1] = MSG_REROUTE_TO_MAP;
+    std::memcpy(buf + 2, &playerGuid, 8);
+    std::memcpy(buf + 10, &mapId, 4);
+
+    natsStatus s = natsConnection_Publish(_nc, "cluster.proxy", buf, 14);
+    if (s != NATS_OK)
+        TC_LOG_WARN("server.worldserver", "NatsBus::SendRerouteToMap: publish failed — {}", natsStatus_GetText(s));
+    else
+        TC_LOG_INFO("server.worldserver", "NatsBus::SendRerouteToMap GUID {:016X} map={}", playerGuid, mapId);
+}
+
+void NatsBus::SendSeamlessReroute(uint64 playerGuid, std::string const& address, uint16 port)
+{
+    if (!_nc || !_connected)
+        return;
+
+    // Wire format for MSG_SEAMLESS_REROUTE:
+    //   [sourceNodeId:1][msgType:1][guid:8][addrLen:1][addr:n][port:2]
+    // No map/position - destination node loads from DB (same map, same position).
+    uint8 addrLen = static_cast<uint8>(std::min(address.size(), std::size_t(255)));
+
+    std::vector<uint8> buf;
+    buf.reserve(2 + 8 + 1 + addrLen + 2);
+
+    buf.push_back(_nodeId);
+    buf.push_back(MSG_SEAMLESS_REROUTE);
+
+    for (int i = 0; i < 8; ++i)
+        buf.push_back(static_cast<uint8>((playerGuid >> (i * 8)) & 0xFF));
+
+    buf.push_back(addrLen);
+    buf.insert(buf.end(), address.begin(), address.begin() + addrLen);
+
+    buf.push_back(static_cast<uint8>(port & 0xFF));
+    buf.push_back(static_cast<uint8>(port >> 8));
+
+    natsConnection_Publish(_nc, "cluster.proxy", buf.data(), static_cast<int>(buf.size()));
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus::SendSeamlessReroute GUID {:016X} -> {}:{}", playerGuid, address, port);
+}
+
+void NatsBus::SendPlayerTransfer(Player const* player, uint8 destNodeId,
+                                      std::string const& address, uint16 port,
+                                      uint32 mapId, float x, float y, float z, float ori)
+{
+    if (!_nc || !_connected) return;
+
+    // 1. Snapshot and serialize player state
+    PlayerTransferData td = SnapshotPlayer(player);
+    std::vector<uint8_t> payload = SerializeTransfer(td);
+
+    // 2. Send transfer data to destination node
+    PublishToNode(destNodeId, MSG_PLAYER_TRANSFER,
+                  payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Sent player transfer GUID {:016X} to node {} ({} bytes)",
+             player->GetGUID().GetRawValue(), destNodeId, payload.size());
+
+    // 3. Tell proxy to reroute client connection
+    SendReroute(player->GetGUID().GetRawValue(), address, port,
+                mapId, x, y, z, ori);
+}
+
+void NatsBus::SendPlayerTransferSeamless(Player const* player, uint8 destNodeId,
+                                              const std::string& address, uint16 port)
+{
+    if (!_nc || !_connected) return;
+
+    // 1. Snapshot full v2 state and serialize
+    PlayerTransferData td = SnapshotPlayerFull(player);
+    std::vector<uint8_t> payload = SerializeTransfer(td);
+
+    // 2. Send transfer data to destination node via NATS
+    PublishToNode(destNodeId, MSG_PLAYER_TRANSFER,
+                  payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Sent seamless player transfer GUID {:016X} to node {} ({} bytes)",
+             player->GetGUID().GetRawValue(), destNodeId, payload.size());
+
+    // 3. Tell proxy to do a seamless backend swap (no loading screen)
+    SendSeamlessReroute(player->GetGUID().GetRawValue(), address, port);
+}
+
+
+void NatsBus::BroadcastPlayerTransferFull(Player const* player)
+{
+    if (!_nc || !_connected || !player) return;
+
+    PlayerTransferData td = SnapshotPlayerFull(player);
+    std::vector<uint8_t> payload = SerializeTransfer(td);
+
+    // Broadcast state sync to all nodes — NOT MSG_PLAYER_TRANSFER.
+    // MSG_PLAYER_TRANSFER is reserved for actual transfer handoffs to a specific dest node.
+    // This sync updates the cache on all nodes so they have current data.
+    PublishBroadcast(MSG_PLAYER_STATE_SYNC_V2,
+                     payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_DEBUG("server.worldserver",
+             "NatsBus: Broadcast v2 state sync for {} ({} bytes)",
+             player->GetName(), payload.size());
+}
+
+void NatsBus::SendPlayerTransferForRedirect(Player const* player,
+                                                 uint8 destNodeId,
+                                                 WorldLocation const& destLoc)
+{
+    if (!_nc || !_connected || !player) return;
+
+    // Snapshot the full v2 state from current in-memory player (auras,
+    // cooldowns, quests, spells, equipment, pet, transport, vitals, etc.).
+    // The snapshot captures the SOURCE position because the player hasn't
+    // physically moved yet.
+    PlayerTransferData td = SnapshotPlayerFull(player);
+
+    // Override position/map with the teleport DESTINATION so the receiving
+    // node spawns the player at the correct coordinates, not the stale
+    // source location.
+    td.mapId       = destLoc.GetMapId();
+    td.posX        = destLoc.GetPositionX();
+    td.posY        = destLoc.GetPositionY();
+    td.posZ        = destLoc.GetPositionZ();
+    td.orientation = destLoc.GetOrientation();
+
+    std::vector<uint8_t> payload = SerializeTransfer(td);
+
+    // Targeted publish — only the destination node needs this.
+    PublishToNode(destNodeId, MSG_PLAYER_TRANSFER,
+                  payload.data(), static_cast<int>(payload.size()));
+
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Sent redirect transfer for {} (GUID {:016X}) to node {} "
+             "dest map={} pos=({:.1f},{:.1f},{:.1f}) ({} bytes)",
+             player->GetName(), player->GetGUID().GetRawValue(), destNodeId,
+             td.mapId, td.posX, td.posY, td.posZ, payload.size());
+}
+
+void NatsBus::AnnounceOnline(Player const* player)
+{
+    if (!_connected || !player)
+        return;
+
+    std::string name = player->GetName();
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+
+    uint64 guid   = player->GetGUID().GetRawValue();
+    uint32 zoneId = player->GetZoneId();
+    uint8 level   = static_cast<uint8>(player->GetLevel());
+    uint8 classId = static_cast<uint8>(player->GetClass());
+    uint8 raceId  = static_cast<uint8>(player->GetRace());
+    uint8 teamId  = static_cast<uint8>(player->GetTeamId());
+
+    // Payload: guid(8)+nameLen(1)+name+zone(4)+level+classId+raceId+teamId+nodeId(1)
+    // nodeId appended so receivers can filter their own broadcasts.
+    std::vector<uint8> payload;
+    payload.reserve(8 + 1 + name.size() + 4 + 5);
+
+    for (int i = 0; i < 8; ++i)
+        payload.push_back(static_cast<uint8>((guid >> (i * 8)) & 0xFF));
+
+    payload.push_back(static_cast<uint8>(name.size()));
+    payload.insert(payload.end(), name.begin(), name.end());
+
+    payload.push_back(static_cast<uint8>(zoneId & 0xFF));
+    payload.push_back(static_cast<uint8>((zoneId >> 8) & 0xFF));
+    payload.push_back(static_cast<uint8>((zoneId >> 16) & 0xFF));
+    payload.push_back(static_cast<uint8>((zoneId >> 24) & 0xFF));
+
+    payload.push_back(level);
+    payload.push_back(classId);
+    payload.push_back(raceId);
+    payload.push_back(teamId);
+    payload.push_back(_nodeId); // receivers use this to filter self-broadcasts
+
+    PublishBroadcast(MSG_CLUSTER_PLAYER_ONLINE, payload.data(), static_cast<int>(payload.size()));
+}
+
+void NatsBus::AnnounceOffline(uint64 playerGuid)
+{
+    if (!_connected)
+        return;
+
+    // Payload: guid(8)+nodeId(1) — nodeId used by receivers to filter self-broadcasts.
+    uint8 payload[9];
+    std::memcpy(payload, &playerGuid, 8);
+    payload[8] = _nodeId;
+
+    PublishBroadcast(MSG_CLUSTER_PLAYER_OFFLINE, payload, 9);
+}
+
+void NatsBus::RelayToNode(uint8 targetNodeId, uint8 innerType, std::vector<uint8> const& payload)
+{
+    if (!_connected)
+        return;
+
+    // Build MSG_CLUSTER_RELAY_TO_NODE payload:
+    // targetNode(1)+innerType(1)+payloadLen(2)+innerPayload
+    uint16 payloadLen = static_cast<uint16>(payload.size());
+    std::vector<uint8> msg;
+    msg.reserve(4 + payload.size());
+    msg.push_back(targetNodeId);
+    msg.push_back(innerType);
+    msg.push_back(static_cast<uint8>(payloadLen & 0xFF));
+    msg.push_back(static_cast<uint8>(payloadLen >> 8));
+    msg.insert(msg.end(), payload.begin(), payload.end());
+
+    PublishToNode(targetNodeId, MSG_CLUSTER_RELAY_TO_NODE, msg.data(), static_cast<int>(msg.size()));
+}
+
+void NatsBus::SendGroupUpdate(uint64 groupGuid, std::vector<uint8> const& memberData)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendGroupUpdate ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendGroupDisband(uint64 groupGuid)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendGroupDisband ignored (phase 2 feature not ported)");
+}
+
+// ── Incoming relay / group handlers ──────────────────────────────────────────
+
+static constexpr uint8 CLUSTER_INNER_GROUP_INVITE        = 0x01;
+static constexpr uint8 CLUSTER_INNER_GROUP_INVITE_RESULT = 0x02;
+static constexpr uint8 CLUSTER_INNER_GROUP_REROUTE_TO_MAP = 0x03;
+
+void NatsBus::HandleIncomingRelay(uint8 innerType, std::vector<uint8> const& payload)
+{
+    switch (innerType)
+    {
+        case CLUSTER_INNER_GROUP_INVITE:
+            TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleIncomingRelay GROUP_INVITE ignored (phase 2 feature not ported)");
+            break;
+
+        case CLUSTER_INNER_GROUP_INVITE_RESULT:
+            TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleIncomingRelay GROUP_INVITE_RESULT ignored (phase 2 feature not ported)");
+            break;
+
+        case CLUSTER_INNER_GROUP_REROUTE_TO_MAP:
+        {
+            // payload: guid(8) + mapId(4)
+            if (payload.size() < 12)
+                return;
+            uint64 guid  = 0;
+            uint32 mapId = 0;
+            std::memcpy(&guid,  payload.data(),     8);
+            std::memcpy(&mapId, payload.data() + 8, 4);
+
+            TC_LOG_DEBUG("server.worldserver", "NatsBus: GROUP_REROUTE_TO_MAP GUID {:016X} → map {}", guid, mapId);
+
+            sWorld->QueueCallback([guid, mapId]()
+            {
+                Player* player = ObjectAccessor::FindPlayer(GuidFromRaw(guid));
+                if (!player)
+                    return;
+                MapEntry const* mEntry = sMapStore.LookupEntry(mapId);
+                if (!mEntry)
+                    return;
+                player->TeleportTo(mapId, player->GetPositionX(), player->GetPositionY(),
+                                   player->GetPositionZ(), player->GetOrientation());
+            });
+            break;
+        }
+
+        default:
+            TC_LOG_WARN("server.worldserver", "NatsBus: Unknown relay inner type 0x{:02X}", innerType);
+            break;
+    }
+}
+
+void NatsBus::HandleGroupUpdate(uint64 groupGuid, uint8 memberCount, std::vector<uint8> const& memberData)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleGroupUpdate ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleGroupDisband(uint64 groupGuid)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleGroupDisband ignored (phase 2 feature not ported)");
+}
+
+// ── LFG relay send methods ────────────────────────────────────────────────────
+
+void NatsBus::SendLFGJoinRelay(uint64 playerGuid, uint8 roles, std::vector<uint32> const& dungeons)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendLFGJoinRelay ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendLFGLeaveRelay(uint64 playerGuid)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendLFGLeaveRelay ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendLFGProposalResultRelay(uint32 proposalId, uint64 playerGuid, bool accept)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendLFGProposalResultRelay ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendLFGRelayResponse(uint8 targetNodeId, uint8 innerType, std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendLFGRelayResponse ignored (phase 2 feature not ported)");
+}
+
+// ── LFG relay incoming handlers ───────────────────────────────────────────────
+
+void NatsBus::HandleLFGRelay(uint8 sourceNodeId, std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleLFGRelay ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleLFGRelayResponse(uint8 innerType, std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleLFGRelayResponse ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::DeliverPacketToPlayer(uint64 targetGuid, WorldPacket const& packet)
+{
+    if (!_connected)
+        return;
+
+    // Serialize the WoW packet into raw bytes (the header is the standard server-side format).
+    // WorldPacket::size() gives the payload size; the actual wire packet needs the header prepended.
+    // We build: header (4 or 5 bytes) + payload.
+    // The proxy will re-encrypt for the client direction via QueuePacketForClient.
+
+    // Build a minimal server-side packet header (size BE, opcode LE).
+    // Size field = opcode_size(2) + payload_size.
+    std::size_t payloadSize = packet.size();
+    uint32 sizeField = static_cast<uint32>(payloadSize) + 2; // +2 for opcode uint16
+
+    std::vector<uint8> rawPacket;
+    if (sizeField > 0x7FFF)
+    {
+        // Large packet: 5-byte header with high bit set.
+        rawPacket.reserve(5 + payloadSize);
+        rawPacket.push_back(static_cast<uint8>(0x80 | ((sizeField >> 16) & 0x7F)));
+        rawPacket.push_back(static_cast<uint8>((sizeField >> 8) & 0xFF));
+        rawPacket.push_back(static_cast<uint8>(sizeField & 0xFF));
+    }
+    else
+    {
+        // Normal packet: 4-byte header.
+        rawPacket.reserve(4 + payloadSize);
+        rawPacket.push_back(static_cast<uint8>((sizeField >> 8) & 0xFF));
+        rawPacket.push_back(static_cast<uint8>(sizeField & 0xFF));
+    }
+
+    uint16 opcode = static_cast<uint16>(packet.GetOpcode());
+    rawPacket.push_back(static_cast<uint8>(opcode & 0xFF));
+    rawPacket.push_back(static_cast<uint8>(opcode >> 8));
+
+    // Append payload.
+    if (payloadSize > 0)
+    {
+        rawPacket.insert(rawPacket.end(),
+            reinterpret_cast<uint8 const*>(packet.contents()),
+            reinterpret_cast<uint8 const*>(packet.contents()) + payloadSize);
+    }
+
+    uint16 pktLen = static_cast<uint16>(rawPacket.size());
+
+    // Look up which node the target player is on.
+    ClusterPlayerInfo const* info = sClusterMgr.FindRemotePlayerByGuid(targetGuid);
+    if (!info)
+    {
+        TC_LOG_DEBUG("server.worldserver",
+                  "NatsBus: DeliverPacketToPlayer — GUID {:016X} not in remote cache", targetGuid);
+        return;
+    }
+    uint8 targetNodeId = info->nodeId;
+
+    std::vector<uint8> payload;
+    payload.reserve(8 + 2 + rawPacket.size());
+
+    for (int i = 0; i < 8; ++i)
+        payload.push_back(static_cast<uint8>((targetGuid >> (i * 8)) & 0xFF));
+
+    payload.push_back(static_cast<uint8>(pktLen & 0xFF));
+    payload.push_back(static_cast<uint8>(pktLen >> 8));
+    payload.insert(payload.end(), rawPacket.begin(), rawPacket.end());
+
+    PublishToNode(targetNodeId, MSG_CLUSTER_DELIVER_PACKET, payload.data(), static_cast<int>(payload.size()));
+}
+
+// ── Outgoing: cluster unit update ─────────────────────────────────────────────
+
+void NatsBus::SendClusterUnitUpdate(Player* player)
+{
+    if (!_connected || _nodeId == 0)
+        return;
+
+    uint64 auraMask = player->GetAuraUpdateMaskForRaid();
+    uint16 auraCount = 0;
+    for (uint32 i = 0; i < MAX_AURAS_GROUP_UPDATE; ++i)
+        if (auraMask & (uint64(1) << i))
+            ++auraCount;
+
+    // Fixed payload: guid(8)+status(2)+hp(4)+maxHp(4)+pwrType(1)+pwr(2)+maxPwr(2)+lvl(2)+zone(2)+auraMask(8) = 35
+    uint16 payloadLen = static_cast<uint16>(35 + auraCount * 5);
+
+    std::vector<uint8> msg;
+    msg.reserve(3 + payloadLen);
+
+    auto pushU8  = [&](uint8  v){ msg.push_back(v); };
+    auto pushU16 = [&](uint16 v){ msg.push_back(static_cast<uint8>(v & 0xFF)); msg.push_back(static_cast<uint8>(v >> 8)); };
+    auto pushU32 = [&](uint32 v){ pushU16(static_cast<uint16>(v & 0xFFFF)); pushU16(static_cast<uint16>(v >> 16)); };
+    auto pushU64 = [&](uint64 v){ pushU32(static_cast<uint32>(v)); pushU32(static_cast<uint32>(v >> 32)); };
+
+    pushU8(MSG_CLUSTER_UNIT_UPDATE);
+    pushU16(payloadLen);
+    pushU64(player->GetGUID().GetRawValue());
+
+    uint16 status = MEMBER_STATUS_ONLINE;
+    if (player->IsPvP())   status |= MEMBER_STATUS_PVP;
+    if (!player->IsAlive())
+    {
+        if (player->HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GHOST)) status |= MEMBER_STATUS_GHOST;
+        else                                            status |= MEMBER_STATUS_DEAD;
+    }
+    if (player->isAFK()) status |= MEMBER_STATUS_AFK;
+    if (player->isDND()) status |= MEMBER_STATUS_DND;
+
+    pushU16(status);
+    Powers power = player->GetPowerType();
+    pushU32(player->GetHealth());
+    pushU32(player->GetMaxHealth());
+    pushU8(static_cast<uint8>(power));
+    pushU16(static_cast<uint16>(player->GetPower(power)));
+    pushU16(static_cast<uint16>(player->GetMaxPower(power)));
+    pushU16(static_cast<uint16>(player->GetLevel()));
+    pushU16(static_cast<uint16>(player->GetZoneId()));
+    pushU64(auraMask);
+
+    for (uint32 i = 0; i < MAX_AURAS_GROUP_UPDATE; ++i)
+    {
+        if (auraMask & (uint64(1) << i))
+        {
+            AuraApplication const* aurApp = player->GetVisibleAura(i);
+            pushU32(aurApp ? aurApp->GetBase()->GetId() : 0);
+            pushU8(1);
+        }
+    }
+
+    PublishBroadcast(MSG_CLUSTER_UNIT_UPDATE, msg.data() + 1, static_cast<int>(msg.size()) - 1);
+}
+
+// ── Incoming: cluster unit update ─────────────────────────────────────────────
+
+void NatsBus::HandleUnitUpdate(std::vector<uint8> const& payload)
+{
+    static constexpr std::size_t FIXED_SIZE = 35; // see wire format
+    if (payload.size() < FIXED_SIZE)
+    {
+        TC_LOG_WARN("server.worldserver", "NatsBus: HandleUnitUpdate — payload too small ({})", payload.size());
+        return;
+    }
+
+    ClusterMgr::ClusterUnitState state;
+    std::size_t off = 0;
+
+    std::memcpy(&state.guid,      payload.data() + off, 8); off += 8;
+    std::memcpy(&state.status,    payload.data() + off, 2); off += 2;
+    std::memcpy(&state.health,    payload.data() + off, 4); off += 4;
+    std::memcpy(&state.maxHealth, payload.data() + off, 4); off += 4;
+    state.powerType = payload[off++];
+    std::memcpy(&state.power,     payload.data() + off, 2); off += 2;
+    std::memcpy(&state.maxPower,  payload.data() + off, 2); off += 2;
+    std::memcpy(&state.level,     payload.data() + off, 2); off += 2;
+    std::memcpy(&state.zoneId,    payload.data() + off, 2); off += 2;
+    std::memcpy(&state.auraMask,  payload.data() + off, 8); off += 8;
+
+    for (uint32 i = 0; i < MAX_AURAS_GROUP_UPDATE; ++i)
+    {
+        if (state.auraMask & (uint64(1) << i))
+        {
+            if (off + 5 > payload.size())
+                break;
+            ClusterMgr::ClusterUnitState::AuraEntry entry;
+            std::memcpy(&entry.spellId, payload.data() + off, 4); off += 4;
+            entry.flags = payload[off++];
+            state.auras.push_back(entry);
+        }
+    }
+
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: UnitUpdate GUID {:016X} HP {}/{}", state.guid, state.health, state.maxHealth);
+    sClusterMgr.UpdateUnitState(std::move(state));
+}
+
+// ── Outgoing: cross-node mail notification ────────────────────────────────────
+
+void NatsBus::SendMailNotify(uint64 recipientGuid)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendMailNotify ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleAnnounceAck(std::vector<uint8> const& payload)
+{
+    if (payload.size() < 1)
+        return;
+
+    uint8 senderNodeId = payload[0];
+
+    if (_clusterRegistered)
+        return; // Already acknowledged — ignore redundant ACKs.
+
+    _clusterRegistered = true;
+    TC_LOG_INFO("server.worldserver",
+             "NatsBus: Cluster registration acknowledged by node {} — node {} is fully registered",
+             senderNodeId, _nodeId);
+}
+
+
+// ── Incoming: cross-node mail notification ────────────────────────────────────
+
+void NatsBus::HandleIncomingMailNotify(uint64 recipientGuid)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleIncomingMailNotify ignored (phase 2 feature not ported)");
+}
+
+// ── Outgoing: cross-node chat relay ───────────────────────────────────────────
+
+void NatsBus::SendChatRelay(uint8 chatMsgType, uint32 zoneId, WorldPacket const& pkt)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendChatRelay ignored (phase 2 feature not ported)");
+}
+
+// ── Incoming: cross-node chat relay ───────────────────────────────────────────
+
+void NatsBus::HandleIncomingChat(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleIncomingChat ignored (phase 2 feature not ported)");
+}
+
+// ── Outgoing: arena team stat broadcast ───────────────────────────────────────
+
+void NatsBus::SendArenaResult(uint32 teamId, uint16 rating, uint16 weekGames, uint16 weekWins,
+                                  uint16 seasonGames, uint16 seasonWins, uint32 rank)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendArenaResult ignored (phase 2 feature not ported)");
+}
+
+// ── Incoming: arena team stat broadcast ───────────────────────────────────────
+
+void NatsBus::HandleIncomingArenaResult(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleIncomingArenaResult ignored (phase 2 feature not ported)");
+}
+
+// ── BG queue relay — outgoing ─────────────────────────────────────────────────
+
+void NatsBus::SendBgQueueJoin(uint64 guid, uint32 bgTypeId, uint8 bracketId, uint8 teamId, uint8 minPerTeam)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendBgQueueJoin ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendBgQueueLeave(uint64 guid, uint32 bgTypeId)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendBgQueueLeave ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::SendBgInstCreated(uint32 matchId, uint32 instanceId, uint32 mapId, uint32 clientInstanceId)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: SendBgInstCreated ignored (phase 2 feature not ported)");
+}
+
+// ── BG queue relay — incoming handlers ────────────────────────────────────────
+
+void NatsBus::HandleBgCreateInst(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleBgCreateInst ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleBgReady(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleBgReady ignored (phase 2 feature not ported)");
+}
+
+// ── BG coordinator handlers (coordinator node only) ───────────────────────────
+
+void NatsBus::HandleBgQueueJoin(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleBgQueueJoin ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleBgQueueLeave(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleBgQueueLeave ignored (phase 2 feature not ported)");
+}
+
+void NatsBus::HandleBgInstCreated(std::vector<uint8> const& payload)
+{
+    TC_LOG_DEBUG("server.worldserver", "NatsBus: HandleBgInstCreated ignored (phase 2 feature not ported)");
+}
