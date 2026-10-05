@@ -2518,6 +2518,10 @@ void World::Update(uint32 diff)
             {
                 TC_LOG_INFO("server.worldserver", "World: Deactivating player {} (GUID {:016X}) -- ownership transferred to another node",
                     player->GetName(), guid);
+                // TC: capture the map BEFORE CleanupsBeforeDelete -- it removes the
+                // player from the world, so an IsInWorld() gate afterwards would never
+                // fire and the Player would leak (mirrors LogoutPlayer's redirect-out path).
+                Map* map = player->FindMap();
                 // TC: CleanupsBeforeDelete is mandatory before a Player is deleted (trade/duel/transport back-pointers)
                 player->CleanupsBeforeDelete();
                 if (WorldSession* session = player->GetSession())
@@ -2526,9 +2530,10 @@ void World::Update(uint32 diff)
                 // old connection alive while it transitions to the new node.
                 // The client will close it when ready, or the session will
                 // time out naturally.
-                if (player->IsInWorld())
-                    if (Map* map = player->FindMap())
-                        map->RemovePlayerFromMap(player, true);
+                if (map)
+                    map->RemovePlayerFromMap(player, true);
+                else
+                    delete player;
             }
         }
     }

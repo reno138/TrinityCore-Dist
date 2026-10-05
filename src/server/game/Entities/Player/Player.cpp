@@ -1342,6 +1342,12 @@ void Player::Update(uint32 p_time)
                 m_zoneTransferDwellTimer = ZONE_TRANSFER_DWELL_MS;
                 // Don't clear dwellZone — keep waiting
             }
+            // Cluster: never fire a zone handoff while a far teleport is pending or the session is already redirected out (save-before-load)
+            else if (IsBeingTeleportedFar() || !IsInWorld() || (GetSession() && GetSession()->IsRedirectedOut()))
+            {
+                m_zoneTransferDwellTimer = ZONE_TRANSFER_DWELL_MS;
+                // Don't clear dwellZone — keep waiting
+            }
             else
             {
             uint32 targetZone = m_zoneTransferDwellZone;
@@ -1998,6 +2004,14 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                 && sNatsBus.IsConnected()
                 && !sClusterMgr.IsMapLocal(mapid))
             {
+                // Cluster: a second cross-node teleport on a redirected-out player must not publish another token
+                if (GetSession()->IsRedirectedOut())
+                {
+                    TC_LOG_DEBUG("server.worldserver", "TeleportTo far: {} already redirected out, ignoring cross-node teleport to map {}",
+                        GetName(), mapid);
+                    return false;
+                }
+
                 // NOTE: transport detach is deferred to the end of this
                 // branch (just before `return true;`).  The snapshot, built by
                 // SendPlayerTransferForRedirect below, reads
@@ -19609,6 +19623,9 @@ void Player::SaveToDB(bool create /*=false*/)
 
 void Player::SaveToDB(CharacterDatabaseTransaction trans, bool create /* = false */)
 {
+    if (GetSession() && GetSession()->IsRedirectedOut())
+        return; // Cluster: the destination node owns this row now
+
     // delay auto save at any saves (manual, in code, or autosave)
     m_nextSave = sWorld->getIntConfig(CONFIG_INTERVAL_SAVE);
 

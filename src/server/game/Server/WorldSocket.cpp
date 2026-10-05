@@ -349,6 +349,13 @@ WorldSocket::ReadDataHandlerResult WorldSocket::ReadDataHandler()
             // cluster: a client redirected here from another node (SMSG_CONNECT_TO) sends this
             // instead of CMSG_AUTH_SESSION on its new connection
             LogOpcodeText(opcode, sessionGuard);
+            // stock (cluster disabled): unauthenticated packet, close like upstream
+            if (!sClusterMgr.IsEnabled())
+            {
+                TC_LOG_ERROR("network", "WorldSocket::ReadDataHandler: received CMSG_AUTH_CONTINUED_SESSION from {} with cluster disabled", GetRemoteIpAddress().to_string());
+                return ReadDataHandlerResult::Error;
+            }
+
             if (_authed)
             {
                 TC_LOG_ERROR("network", "WorldSocket::ReadDataHandler: received duplicate CMSG_AUTH_CONTINUED_SESSION from {}", GetRemoteIpAddress().to_string());
@@ -958,7 +965,12 @@ bool WorldSocket::HandlePing(WorldPacket& recvPacket)
         std::lock_guard<std::mutex> sessionGuard(_worldSessionLock);
 
         if (_worldSession)
+        {
             _worldSession->SetLatency(latency);
+            // Cluster: nothing is sent on a connection whose session was redirected out
+            if (_worldSession->IsRedirectedOut())
+                return true;
+        }
         else
         {
             TC_LOG_ERROR("network", "WorldSocket::HandlePing: peer sent CMSG_PING, but is not authenticated or got recently kicked, address = {}", GetRemoteIpAddress().to_string());

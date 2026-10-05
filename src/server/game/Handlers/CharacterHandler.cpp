@@ -786,8 +786,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
                          "Disconnecting without re-redirect to avoid client crash.",
                          pCurrChar->GetName(), reason);
                 SetPlayer(nullptr);
-                // TC ~Unit asserts no auras remain; the character was fully loaded
-                pCurrChar->RemoveAllAuras();
+                // TC: CleanupsBeforeDelete unbinds instance saves and asserts-free aura teardown
+                pCurrChar->CleanupsBeforeDelete();
                 delete pCurrChar;
                 m_playerLoading = false;
                 KickPlayer("wrong-node mid-redirect: disconnect to force clean cold reconnect");
@@ -816,8 +816,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
             if (token == 0)
             {
                 SetPlayer(nullptr);
-                // TC ~Unit asserts no auras remain; the character was fully loaded
-                pCurrChar->RemoveAllAuras();
+                // TC: CleanupsBeforeDelete unbinds instance saves and asserts-free aura teardown
+                pCurrChar->CleanupsBeforeDelete();
                 delete pCurrChar;
                 m_playerLoading = false;
                 KickPlayer("redirect token generation failed");
@@ -844,7 +844,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
             // suspended connection and break the redirect.
             SetRedirectedOut();
             SetPlayer(nullptr);
-            pCurrChar->RemoveAllAuras();
+            // TC: CleanupsBeforeDelete unbinds instance saves and asserts-free aura teardown
+            pCurrChar->CleanupsBeforeDelete();
             delete pCurrChar;
             m_playerLoading = false;
             return;

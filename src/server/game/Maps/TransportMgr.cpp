@@ -18,6 +18,7 @@
 #include "TransportMgr.h"
 #include "DatabaseEnv.h"
 #include "InstanceScript.h"
+#include "ClusterMgr.h"
 #include "Log.h"
 #include "MapManager.h"
 #include "MoveSplineInitArgs.h"
@@ -389,80 +390,107 @@ Transport* TransportMgr::CreateTransport(uint32 entry, ObjectGuid::LowType guid 
         return nullptr;
     }
 
-    // Synchronise the spawn position to the real wall-clock (Unix epoch ms) so
-    // all cluster nodes agree on transport positions regardless of when each
-    // node process started.  If a peer-queried PathProgress is available (set
-    // by SpawnContinentTransports via NatsBus::QueryTransportSync) it takes
-    // precedence - giving perfect per-transport accuracy without any NTP dependency.
-    //
-    // Note: continent transports always have a non-zero DB guid; instance transports
-    // use guid=0 (auto-generated) and don't need clock sync.
-    uint32 const period = tInfo->pathTime;
-
     uint32 timer = 0;
-    if (period)
+    bool clockSynced = false;
+    uint32 spawnMapId;
+    float spawnX, spawnY, spawnZ, spawnO;
+
+    // Cluster: peer/clock spawn sync only when clustering is enabled and only for
+    // continent transports (non-zero DB guid). Stock and instance transports keep
+    // TrinityCore's first-waypoint spawn with no InitializeToTime.
+    if (sClusterMgr.IsEnabled() && guid != 0)
     {
-        bool usedPeerSync = false;
-        if (guid != 0)
+        clockSynced = true;
+        // Synchronise the spawn position to the real wall-clock (Unix epoch ms) so
+        // all cluster nodes agree on transport positions regardless of when each
+        // node process started.  If a peer-queried PathProgress is available (set
+        // by SpawnContinentTransports via NatsBus::QueryTransportSync) it takes
+        // precedence - giving perfect per-transport accuracy without any NTP dependency.
+        //
+        // Note: continent transports always have a non-zero DB guid; instance transports
+        // use guid=0 (auto-generated) and don't need clock sync.
+        uint32 const period = tInfo->pathTime;
+
+        if (period)
         {
-            auto const it = _spawnSyncData.find(static_cast<uint32>(guid));
-            if (it != _spawnSyncData.end())
+            bool usedPeerSync = false;
+            if (guid != 0)
             {
-                // Use the exact PathProgress received from a running peer node.
-                timer = it->second % period;
-                usedPeerSync = true;
+                auto const it = _spawnSyncData.find(static_cast<uint32>(guid));
+                if (it != _spawnSyncData.end())
+                {
+                    // Use the exact PathProgress received from a running peer node.
+                    timer = it->second % period;
+                    usedPeerSync = true;
+                }
+            }
+
+            if (!usedPeerSync)
+            {
+                // Fallback: Unix epoch ms % period - all nodes share the same
+                // wall-clock (NTP keeps drift <50 ms, well within tolerance).
+                uint64 const wallMs = static_cast<uint64>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count());
+                timer = static_cast<uint32>(wallMs % period);
             }
         }
 
-        if (!usedPeerSync)
+        // Walk key frames to find the spawn map and reference position for 'timer'.
+        spawnMapId = tInfo->keyFrames.begin()->Node->ContinentID;
+        spawnX     = tInfo->keyFrames.begin()->Node->Loc.X;
+        spawnY     = tInfo->keyFrames.begin()->Node->Loc.Y;
+        spawnZ     = tInfo->keyFrames.begin()->Node->Loc.Z;
+        spawnO     = tInfo->keyFrames.begin()->InitialOrientation;
+
+        if (period)
         {
-            // Fallback: Unix epoch ms % period - all nodes share the same
-            // wall-clock (NTP keeps drift <50 ms, well within tolerance).
-            uint64 const wallMs = static_cast<uint64>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-            timer = static_cast<uint32>(wallMs % period);
+            auto cur = tInfo->keyFrames.begin();
+            auto nxt = cur; ++nxt;
+
+            for (;;)
+            {
+                // Stop frame: docked here.
+                if (timer >= cur->ArriveTime && timer < cur->DepartureTime)
+                    break;
+                // Moving between cur departure and nxt arrival.
+                if (timer >= cur->DepartureTime && timer < cur->NextArriveTime)
+                    break;
+                // Advance (teleport frames are silently skipped - spawn map is
+                // determined by where the timer lands after all advances).
+                cur = nxt++;
+                if (nxt == tInfo->keyFrames.end())
+                    nxt = tInfo->keyFrames.begin();
+            }
+
+            spawnMapId = cur->Node->ContinentID;
+            spawnX     = cur->Node->Loc.X;
+            spawnY     = cur->Node->Loc.Y;
+            spawnZ     = cur->Node->Loc.Z;
+            spawnO     = cur->InitialOrientation;
         }
     }
-
-    // Walk key frames to find the spawn map and reference position for 'timer'.
-    uint32 spawnMapId = tInfo->keyFrames.begin()->Node->ContinentID;
-    float  spawnX     = tInfo->keyFrames.begin()->Node->Loc.X;
-    float  spawnY     = tInfo->keyFrames.begin()->Node->Loc.Y;
-    float  spawnZ     = tInfo->keyFrames.begin()->Node->Loc.Z;
-    float  spawnO     = tInfo->keyFrames.begin()->InitialOrientation;
-
-    if (period)
+    else
     {
-        auto cur = tInfo->keyFrames.begin();
-        auto nxt = cur; ++nxt;
+        // ...at first waypoint
+        TaxiPathNodeEntry const* startNode = tInfo->keyFrames.begin()->Node;
+        uint32 mapId = startNode->ContinentID;
+        float x = startNode->Loc.X;
+        float y = startNode->Loc.Y;
+        float z = startNode->Loc.Z;
+        float o = tInfo->keyFrames.begin()->InitialOrientation;
 
-        for (;;)
-        {
-            // Stop frame: docked here.
-            if (timer >= cur->ArriveTime && timer < cur->DepartureTime)
-                break;
-            // Moving between cur departure and nxt arrival.
-            if (timer >= cur->DepartureTime && timer < cur->NextArriveTime)
-                break;
-            // Advance (teleport frames are silently skipped - spawn map is
-            // determined by where the timer lands after all advances).
-            cur = nxt++;
-            if (nxt == tInfo->keyFrames.end())
-                nxt = tInfo->keyFrames.begin();
-        }
-
-        spawnMapId = cur->Node->ContinentID;
-        spawnX     = cur->Node->Loc.X;
-        spawnY     = cur->Node->Loc.Y;
-        spawnZ     = cur->Node->Loc.Z;
-        spawnO     = cur->InitialOrientation;
+        spawnMapId = mapId;
+        spawnX = x;
+        spawnY = y;
+        spawnZ = z;
+        spawnO = o;
     }
 
     // create transport...
     Transport* trans = new Transport();
 
-    // initialize the gameobject base at the clock-synchronised position
+    // initialize the gameobject base (clock-synchronised position when clustered)
     ObjectGuid::LowType guidLow = guid ? guid : sObjectMgr->GetGenerator<HighGuid::Mo_Transport>().Generate();
 
     if (!trans->Create(guidLow, entry, spawnMapId, spawnX, spawnY, spawnZ, spawnO, 255))
@@ -487,7 +515,8 @@ Transport* TransportMgr::CreateTransport(uint32 entry, ObjectGuid::LowType guid 
         trans->m_zoneScript = map->ToInstanceMap()->GetInstanceScript();
 
     // Advance frame state to match the server clock (no events, no teleport).
-    trans->InitializeToTime(timer);
+    if (clockSynced)
+        trans->InitializeToTime(timer);
 
     // Passengers will be loaded once a player is near
     HashMapHolder<Transport>::Insert(trans);
