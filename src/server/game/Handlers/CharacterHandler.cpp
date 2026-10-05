@@ -786,6 +786,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
                          "Disconnecting without re-redirect to avoid client crash.",
                          pCurrChar->GetName(), reason);
                 SetPlayer(nullptr);
+                // TC ~Unit asserts no auras remain; the character was fully loaded
+                pCurrChar->RemoveAllAuras();
                 delete pCurrChar;
                 m_playerLoading = false;
                 KickPlayer("wrong-node mid-redirect: disconnect to force clean cold reconnect");
@@ -814,6 +816,8 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
             if (token == 0)
             {
                 SetPlayer(nullptr);
+                // TC ~Unit asserts no auras remain; the character was fully loaded
+                pCurrChar->RemoveAllAuras();
                 delete pCurrChar;
                 m_playerLoading = false;
                 KickPlayer("redirect token generation failed");
@@ -1140,17 +1144,14 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     // transport CREATE_OBJECT before the player's own CREATE_OBJECT2 when GetTransport()
     // is non-null.  No manual pre-send needed here — that caused a triple-send which
     // destroyed the transport sound emitter on the client.
-    // On a NATS transfer arrival the player enters via the login path
-    // (PlayerLoading=true). UpdateLocalChannels skips when PlayerLoading &&
-    // !IsBeingTeleportedFar — set the semaphore so it treats this as a teleport
-    // and sends the correct zone channel joins to the client.
-    if (hadNatsTransfer)
+    // Cluster: on a handoff arrival, let UpdateLocalChannels send the zone channel joins
+    // (it skips while PlayerLoading() && !IsBeingTeleportedFar()). Only touch the semaphore
+    // if TC's own login path did not already set it (failed AddPlayerToMap -> TeleportTo home).
+    bool const wasTeleportedFar = pCurrChar->IsBeingTeleportedFar();
+    if (hadNatsTransfer && !wasTeleportedFar)
         pCurrChar->SetSemaphoreTeleportFar(true);
-
     pCurrChar->SendInitialPacketsAfterAddToMap();
-
-    // Clear the semaphore now that SendInitialPacketsAfterAddToMap has run.
-    if (pCurrChar->IsBeingTeleportedFar())
+    if (hadNatsTransfer && !wasTeleportedFar)
         pCurrChar->SetSemaphoreTeleportFar(false);
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
