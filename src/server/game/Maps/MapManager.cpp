@@ -17,6 +17,7 @@
 
 #include "MapManager.h"
 #include "InstanceSaveMgr.h"
+#include "ClusterMgr.h"
 #include "DatabaseEnv.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
@@ -77,6 +78,37 @@ Map* MapManager::CreateBaseMap(uint32 id)
 
         MapEntry const* entry = sMapStore.LookupEntry(id);
         ASSERT(entry);
+
+        // Cluster: only fully create maps owned by this node.
+        //   - Non-local instance maps: skip entirely (instance node owns them).
+        //   - Non-local continent maps: create as a ghost (transport routing only,
+        //     no creature/GO spawning - EnsureGridLoaded is a no-op on ghost maps).
+        if (sClusterMgr.IsEnabled() && !sClusterMgr.IsMapLocal(id))
+        {
+            if (entry->Instanceable())
+            {
+                TC_LOG_DEBUG("maps.cluster", "Cluster: Skipping non-local instance map {} on node {}",
+                    id, sClusterMgr.GetNodeId());
+                return nullptr;
+            }
+            map = new Map(id, i_gridCleanUpDelay, 0, REGULAR_DIFFICULTY);
+            map->SetGhostMap();
+            Trinity::unique_trackable_ptr<Map>& ptr = i_maps[id];
+            ptr.reset(map);
+            map->SetWeakPtr(ptr);
+            sScriptMgr->OnCreateMap(map);
+            TC_LOG_DEBUG("maps.cluster", "Cluster: Created ghost map {} on node {} (transport routing only)",
+                id, sClusterMgr.GetNodeId());
+            return map;
+        }
+
+        // Legacy standalone instance-server mode (non-cluster deployments).
+        if (sConfigMgr->GetBoolDefault("InstanceServer.Enable", false) && !entry->Instanceable())
+        {
+            TC_LOG_DEBUG("maps", "InstanceServer: Skipping continent map {} (type={}) - handled by worldserver node.",
+                id, entry->InstanceType);
+            return nullptr;
+        }
 
         if (entry->Instanceable())
             map = new MapInstanced(id, i_gridCleanUpDelay);

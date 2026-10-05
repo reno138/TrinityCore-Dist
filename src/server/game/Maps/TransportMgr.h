@@ -21,6 +21,7 @@
 #include "DBCStores.h"
 #include "ObjectGuid.h"
 #include <memory>
+#include <unordered_map>
 
 struct KeyFrame;
 struct GameObjectTemplate;
@@ -160,6 +161,10 @@ class TC_GAME_API TransportMgr
         TransportInstanceMap _instanceTransports;
 
         TransportAnimationContainer _transportAnimations;
+
+        // Peer-reported PathProgress keyed by transport guid_low (filled once by
+        // SpawnContinentTransports via NatsBus::QueryTransportSync, read by CreateTransport).
+        std::unordered_map<uint32, uint32> _spawnSyncData;
 };
 
 #define sTransportMgr TransportMgr::instance()

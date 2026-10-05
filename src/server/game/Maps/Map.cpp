@@ -248,6 +248,10 @@ void Map::LoadMapAndVMap(int gx, int gy)
 
 void Map::LoadAllCells()
 {
+    // Ghost maps exist only for transport routing - never preload their grids.
+    if (_ghostMap)
+        return;
+
     for (uint32 cellX = 0; cellX < TOTAL_NUMBER_OF_CELLS_PER_MAP; cellX++)
         for (uint32 cellY = 0; cellY < TOTAL_NUMBER_OF_CELLS_PER_MAP; cellY++)
             LoadGrid((cellX + 0.5f - CENTER_GRID_CELL_ID) * SIZE_OF_GRID_CELL, (cellY + 0.5f - CENTER_GRID_CELL_ID) * SIZE_OF_GRID_CELL);
@@ -533,6 +537,11 @@ void Map::EnsureGridLoadedForActiveObject(Cell const& cell, WorldObject* object)
 bool Map::EnsureGridLoaded(Cell const& cell)
 {
     EnsureGridCreated(GridCoord(cell.GridX(), cell.GridY()));
+
+    // Ghost maps exist only for transport routing - suppress creature/GO spawning.
+    if (_ghostMap)
+        return false;
+
     NGridType *grid = getNGrid(cell.GridX(), cell.GridY());
 
     ASSERT(grid != nullptr);
@@ -1056,7 +1065,7 @@ void Map::RemoveFromMap(Transport* obj, bool remove)
         WorldPacket packet;
         data.BuildPacket(&packet);
         for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
-        if (itr->GetSource()->GetTransport() != obj)
+        if (itr->GetSource()->GetTransport() != obj && !itr->GetSource()->IsBeingTeleportedFar())
             itr->GetSource()->SendDirectMessage(&packet);
     }
 
