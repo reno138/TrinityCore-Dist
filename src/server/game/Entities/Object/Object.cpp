@@ -49,6 +49,7 @@
 #include "VMapFactory.h"
 #include "VMapManager2.h"
 #include "World.h"
+#include "WorldSession.h"
 #include <G3D/Vector3.h>
 
 constexpr float VisibilityDistances[AsUnderlyingType(VisibilityDistanceType::Max)] =
@@ -3462,6 +3463,16 @@ void WorldObject::DestroyForNearbyPlayers()
 
         if (!player->HaveAtClient(this))
             continue;
+
+        // Cluster: skip SMSG_DESTROY_OBJECT for players mid-redirect: their source session is
+        // closing and the destination node provides a complete fresh world state on
+        // reconnect, so these packets would only race against the loading screen.
+        // Still drop the guid from the client set so it stays consistent.
+        if (player->GetSession() && player->GetSession()->IsRedirectPending())
+        {
+            player->m_clientGUIDs.erase(GetGUID());
+            continue;
+        }
 
         if (Unit const* unit = ToUnit())
         {

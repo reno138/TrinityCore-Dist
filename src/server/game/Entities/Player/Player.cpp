@@ -36,6 +36,8 @@
 #include "Chat.h"
 #include "ChatPackets.h"
 #include "CinematicMgr.h"
+#include "ClientRedirect.h"
+#include "ClusterMgr.h"
 #include "CombatLogPackets.h"
 #include "CombatPackets.h"
 #include "Common.h"
@@ -75,6 +77,7 @@
 #include "MiscPackets.h"
 #include "MotionMaster.h"
 #include "MovementPackets.h"
+#include "NatsBus.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -89,6 +92,8 @@
 #include "QuestPools.h"
 #include "Realm.h"
 #include "ReputationMgr.h"
+#include "SharedPlayerCache.h"
+#include "SharedPlayerState.h"
 #include "SkillDiscovery.h"
 #include "SocialMgr.h"
 #include "Spell.h"
@@ -113,6 +118,7 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 #include "WorldStatePackets.h"
+#include <random>
 
 #define ZONE_UPDATE_INTERVAL (1*IN_MILLISECONDS)
 
@@ -123,6 +129,14 @@
 static uint32 corpseReclaimDelay[MAX_DEATH_COUNT] = { 30, 60, 120 };
 
 uint32 const MAX_MONEY_AMOUNT = static_cast<uint32>(std::numeric_limits<int32>::max());
+
+// Cluster: push a full transfer snapshot to the other nodes after a change that the
+// 10 Hz delta does not carry (level, spells, talents, equipment, death state).
+static void ClusterBroadcastFull(Player* player)
+{
+    if (sClusterMgr.IsEnabled() && sNatsBus.IsConnected())
+        sNatsBus.BroadcastPlayerTransferFull(player);
+}
 
 Player::Player(WorldSession* session): Unit(true)
 {
@@ -919,8 +933,65 @@ void Player::UpdateInvisibilityDrunkDetect()
 
 void Player::Update(uint32 p_time)
 {
+    // Cluster: zone reroute in progress. Skip ALL updates on this player.
+    // The proxy is switching backends; when it closes the old connection,
+    // WorldSession::Update will detect the closed socket and call LogoutPlayer
+    // safely (before Map iteration starts on the next tick).
+    if (m_pendingZoneReroute)
+        return;
+
     if (!IsInWorld())
         return;
+
+    // Cluster: deferred transport reattach — fires when Block 1 in HandlePlayerLogin
+    // couldn't find the transport because it hadn't crossed to this map yet (timing race).
+    // Retries every 200ms for up to 2.5s; on success snaps the player onto the deck.
+    if (sClusterMgr.IsEnabled() && GetSession() && GetSession()->HasPendingTransportAttach() && !GetTransport())
+    {
+        constexpr uint32 RETRY_INTERVAL_MS = 200;
+        constexpr uint32 RETRY_TIMEOUT_MS  = 2500;
+
+        m_transportReattachTimer += p_time;
+
+        if (m_transportReattachTimer >= RETRY_TIMEOUT_MS)
+        {
+            TC_LOG_WARN("server.worldserver",
+                "Cross-node transport reattach timed out for {} (entry={}) — giving up after {}ms",
+                GetName(), GetSession()->GetPendingTransportAttach().entry, m_transportReattachTimer);
+            GetSession()->ClearPendingTransportAttach();
+            m_transportReattachTimer = 0;
+        }
+        else if (m_transportReattachTimer % RETRY_INTERVAL_MS < uint32(p_time))
+        {
+            auto const& pa = GetSession()->GetPendingTransportAttach();
+            Transport* t = nullptr;
+            {
+                auto& container = HashMapHolder<Transport>::GetContainer();
+                std::shared_lock lock(*HashMapHolder<Transport>::GetLock());
+                for (auto const& pair : container)
+                    if (pair.second->GetEntry() == pa.entry && pair.second->GetMapId() == pa.mapId)
+                    { t = pair.second; break; }
+            }
+            if (t)
+            {
+                float tx = pa.offsetX, ty = pa.offsetY, tz = pa.offsetZ, to = pa.offsetO;
+                t->AddPassenger(this);
+                SetTransport(t);
+                AddUnitState(UNIT_STATE_IGNORE_PATHFINDING);
+                m_movementInfo.transport.guid = t->GetGUID();
+                m_movementInfo.transport.pos.Relocate(tx, ty, tz, to);
+                m_movementInfo.AddMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+                float wx = tx, wy = ty, wz = tz, wo = to;
+                t->CalculatePassengerPosition(wx, wy, wz, &wo);
+                NearTeleportTo(wx, wy, wz, wo);
+                TC_LOG_INFO("server.worldserver",
+                    "Cross-node transport reattach deferred OK for {} entry={} at {}ms",
+                    GetName(), pa.entry, m_transportReattachTimer);
+                GetSession()->ClearPendingTransportAttach();
+                m_transportReattachTimer = 0;
+            }
+        }
+    }
 
     // undelivered mail
     if (m_nextMailDelivereTime && m_nextMailDelivereTime <= GameTime::GetGameTime())
@@ -1135,6 +1206,12 @@ void Player::Update(uint32 p_time)
                 if (m_areaUpdateId != newarea)
                     UpdateArea(newarea);
 
+                // Cluster: the zone did not change, but routing still must be
+                // evaluated — a player who logs in already standing inside a
+                // non-local zone never fires a zone-change event, so UpdateZone
+                // is never called and the dwell timer would never arm.
+                UpdateClusterZoneRouting(newzone);
+
                 m_zoneUpdateTimer = ZONE_UPDATE_INTERVAL;
             }
         }
@@ -1250,6 +1327,156 @@ void Player::Update(uint32 p_time)
 
     if (IsHasDelayedTeleport())
         TeleportTo(m_teleport_dest, m_teleport_options);
+
+    // Cluster: zone transfer dwell timer
+    if (m_zoneTransferDwellTimer > 0)
+    {
+        if (m_zoneTransferDwellTimer <= p_time)
+        {
+            m_zoneTransferDwellTimer = 0;
+
+            // If cooldown is still active, or the player died while dwelling,
+            // restart the dwell timer (wait)
+            if (m_zoneTransferCooldown > 0 || !IsAlive())
+            {
+                m_zoneTransferDwellTimer = ZONE_TRANSFER_DWELL_MS;
+                // Don't clear dwellZone — keep waiting
+            }
+            else
+            {
+            uint32 targetZone = m_zoneTransferDwellZone;
+            m_zoneTransferDwellZone = 0;
+
+            auto destNode = sClusterMgr.GetNodeForZone(targetZone);
+            if (destNode && sNatsBus.IsConnected())
+            {
+                TC_LOG_INFO("server.worldserver",
+                         "Player {} zone transfer: zone {} -> node {} ({}:{}) [dwell expired]",
+                         GetName(), targetZone, destNode->nodeId, destNode->address, destNode->port);
+
+                // 0. Full save before handoff — mirrors the map-transfer path in
+                //    Player::TeleportTo. LogoutPlayer's redirect-out fast path
+                //    deliberately skips SaveToDB, and the NATS transfer payload only
+                //    carries Player fields (position/level/health/auras) — NOT session
+                //    or account state such as tutorial flags, nor quests/reputation/
+                //    glyphs/actions. Without this, anything changed since the last
+                //    periodic save is silently discarded on every zone handoff.
+                //
+                //    The destination loads the character from this save, so the
+                //    transfer snapshot and the redirect token are published only
+                //    once the commit has completed: the destination admits the
+                //    reconnecting client when the token arrives (it waits up to
+                //    REDIRECT_TOKEN_WAIT_MS), so its LoadFromDB can no longer read
+                //    the row from before this save. The client-facing packets go
+                //    out immediately; the ~20ms commit is hidden by the reconnect.
+                uint32 const token = ClientRedirect::GenerateToken();
+                if (token == 0)
+                    return; // CSPRNG failure — abort this handoff, retry next zone tick
+                {
+                    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                    SaveToDB(trans, false);
+
+                    ObjectGuid const guid = GetGUID();
+                    ClusterNodeInfo const dest = *destNode;
+                    uint32 const accountId = GetSession()->GetAccountId();
+                    std::string const remoteAddress = GetSession()->GetRemoteAddress();
+                    auto const addons = ClusterAddonsFromSession(GetSession()->GetSecureAddons());
+                    uint32 const saveDispatchMs = getMSTime();
+                    GetSession()->AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(trans))
+                        .AfterComplete([guid, dest, token, accountId, remoteAddress, addons, saveDispatchMs](bool success)
+                    {
+                        TC_LOG_INFO("server.worldserver", "Cluster handoff: save commit for {} took {} ms (success={})",
+                                    guid.ToString(), GetMSTimeDiffToNow(saveDispatchMs), success);
+
+                        Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+                        if (!success || !player)
+                        {
+                            TC_LOG_ERROR("server.worldserver",
+                                      "Zone handoff of {} to node {} not published: {}",
+                                      guid.ToString(), dest.nodeId,
+                                      success ? "player gone" : "pre-handoff save failed");
+                            return;
+                        }
+
+                        // 1. Send actual transfer data to SPECIFIC dest node (not broadcast)
+                        sNatsBus.SendPlayerTransferSeamless(player, dest.nodeId, dest.address, dest.port);
+
+                        // 2. Redirect token to the dest node (after the transfer: same
+                        //    subject, NATS keeps the order, the dest admits on the token)
+                        sNatsBus.PublishRedirectToken(accountId, guid.GetRawValue(), token,
+                                                      dest.nodeId, remoteAddress, addons);
+                    });
+                }
+
+                // 2. Broadcast state sync so all OTHER nodes update their cache
+                sNatsBus.BroadcastPlayerStateFull(GetGUID().GetRawValue());
+
+                // 3. Claim ownership on destination
+                sNatsBus.ClaimPlayer(GetGUID().GetRawValue());
+
+                // 4. Redirect client to destination node (client disconnects + reconnects)
+                // NOTE: Do NOT send SMSG_SUSPEND_COMMS before SMSG_REDIRECT_CLIENT!
+                // Binary analysis shows the client checks the suspended flag (0x538) and
+                // skips the redirect entirely if it's set. Just send the redirect directly.
+                auto [redirectIp, redirectPort] = sClusterMgr.GetRedirectAddressForNode(
+                    destNode->nodeId, GetSession()->GetRemoteAddress());
+                ClientRedirect::RedirectClient(GetSession(), redirectIp, redirectPort, token);
+
+                // 5. Mark session as redirected-out: this is a migration, not a logout.
+                //    Stops Player::Update via m_pendingZoneReroute, and tells
+                //    LogoutPlayer to skip SaveToDB/AnnounceOffline/social cleanup.
+                GetSession()->SetRedirectedOut();
+                m_pendingZoneReroute = true;
+                m_zoneTransferCooldown = ZONE_TRANSFER_COOLDOWN_MS;
+                return;
+            }
+            } // end cooldown check
+        }
+        else
+        {
+            m_zoneTransferDwellTimer -= p_time;
+        }
+    }
+
+    // Decrement transfer cooldown
+    if (m_zoneTransferCooldown > 0)
+        m_zoneTransferCooldown = (m_zoneTransferCooldown > p_time) ? m_zoneTransferCooldown - p_time : 0;
+
+    // Cluster: periodic full state refresh (cold tier — every 2 minutes)
+    if (sClusterMgr.IsEnabled() && sNatsBus.IsConnected())
+    {
+        m_clusterFullRefreshTimer += p_time;
+        if (m_clusterFullRefreshTimer >= CLUSTER_FULL_REFRESH_MS)
+        {
+            m_clusterFullRefreshTimer = 0;
+            sNatsBus.BroadcastPlayerTransferFull(this);
+        }
+    }
+
+    // Cluster: detect state changes for broadcast
+    if (sClusterMgr.IsEnabled())
+    {
+        MarkClusterStateDirty(STATE_FIELD_POSITION); // always — movement is continuous
+        if (GetHealth() != m_clusterLastHealth)
+        {
+            MarkClusterStateDirty(STATE_FIELD_HEALTH);
+            m_clusterLastHealth = GetHealth();
+        }
+        if (GetPower(GetPowerType()) != m_clusterLastPower)
+        {
+            MarkClusterStateDirty(STATE_FIELD_POWER);
+            m_clusterLastPower = GetPower(GetPowerType());
+        }
+        if (IsInCombat() != m_clusterLastCombat || isDead() != m_clusterLastDead)
+        {
+            MarkClusterStateDirty(STATE_FIELD_COMBAT | STATE_FIELD_DEATH);
+            m_clusterLastCombat = IsInCombat();
+            m_clusterLastDead = isDead();
+        }
+    }
+
+    // Cluster: broadcast dirty state to all nodes at 10Hz
+    BroadcastClusterStateIfDirty(p_time);
 }
 
 void Player::Heartbeat()
@@ -1741,18 +1968,227 @@ bool Player::TeleportTo(uint32 mapid, float x, float y, float z, float orientati
                 SendDirectMessage(transferPending.Write());
             }
 
-            // remove from old map now
-            if (oldmap)
-                oldmap->RemovePlayerFromMap(this, false);
-
-            // players on mount will be dismounted. the speed and height change should not require an ACK and should be applied directly
-            PurgeAndApplyPendingMovementChanges(false);
-
+            // Set teleport destination BEFORE removing from old map so that
+            // the cross-node snapshot (below) can read m_transport while it is
+            // still valid.  RemovePlayerFromMap → CleanupsBeforeDelete calls
+            // SetTransport(nullptr), which would make the snapshot see
+            // GetTransport()==nullptr and emit onTransport=false, losing the
+            // passenger's seat offset on the destination node.
             m_teleport_dest = WorldLocation(mapid, x, y, z, orientation);
             m_teleport_options = options;
             SetFallInformation(0, GetPositionZ());
             // if the player is saved before worldportack (at logout for example)
             // this will be used instead of the current location in SaveToDB
+
+            // Cross-node teleport: redirect client directly to the destination
+            // worldserver node via SMSG_REDIRECT_CLIENT.  The client disconnects
+            // and reconnects to the destination, which does LoadFromDB.
+            //
+            // CRITICAL: this block must appear BEFORE RemovePlayerFromMap so
+            // that m_transport is still set when the snapshot runs.
+            // For cross-node redirects, the player stays in the old map until
+            // the source session closes (SMSG_SUSPEND_COMMS → disconnect →
+            // LogoutPlayer → RemovePlayerFromMap).  We do NOT call
+            // RemovePlayerFromMap here for the cross-node path.
+            TC_LOG_INFO("server.worldserver",
+                     "TeleportTo far: player={} mapid={} IsMapLocal={} ProxyConnected={} PlayerLogout={}",
+                     GetName(), mapid, sClusterMgr.IsMapLocal(mapid),
+                     sNatsBus.IsConnected(), GetSession()->PlayerLogout());
+            if (!GetSession()->PlayerLogout()
+                && sNatsBus.IsConnected()
+                && !sClusterMgr.IsMapLocal(mapid))
+            {
+                // NOTE: transport detach is deferred to the end of this
+                // branch (just before `return true;`).  The snapshot, built by
+                // SendPlayerTransferForRedirect below, reads
+                // player->GetTransport() to populate the transport entry and
+                // offsets in the NATS payload; the destination node reattaches
+                // the arriving passenger in HandlePlayerLogin.  Continent
+                // transports share a deterministic DB guid across all nodes,
+                // so the same ObjectGuid resolves locally on the destination.
+
+                // Full save before redirect: flush all in-memory state (reputation,
+                // money, XP, quests, skills, glyphs, achievements, etc.) to DB so
+                // the destination node's LoadFromDB gets a complete picture.
+                //
+                // Must run BEFORE SetSemaphoreTeleportFar — SaveToDB early-returns
+                // when IsBeingTeleportedFar() is true.
+                //
+                // The destination position is the LAST statement in the transaction
+                // so it overwrites the source position that SaveToDB wrote.
+                // The commit is async. The destination loads the character from
+                // this save, so the transfer snapshot and the redirect token are
+                // published from the commit callback: the destination admits the
+                // reconnecting client only when the token arrives (it waits up to
+                // REDIRECT_TOKEN_WAIT_MS), so its LoadFromDB cannot read the row
+                // from before this save.
+                auto destNode = sClusterMgr.GetNodeForMap(mapid);
+                uint32 const token = destNode ? ClientRedirect::GenerateToken() : 0;
+                {
+                    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                    SaveToDB(trans, false);
+
+                    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHARACTER_POSITION);
+                    stmt->setFloat(0, m_teleport_dest.GetPositionX());
+                    stmt->setFloat(1, m_teleport_dest.GetPositionY());
+                    stmt->setFloat(2, m_teleport_dest.GetPositionZ());
+                    stmt->setFloat(3, m_teleport_dest.GetOrientation());
+                    stmt->setUInt16(4, uint16(mapid));
+                    stmt->setUInt32(5, 0);  // zone — resolved on load
+                    stmt->setUInt32(6, GetGUID().GetCounter());
+                    trans->Append(stmt);
+
+                    if (destNode && token != 0)
+                    {
+                        ObjectGuid const guid = GetGUID();
+                        ClusterNodeInfo const dest = *destNode;
+                        WorldLocation const destLoc = m_teleport_dest;
+                        uint32 const accountId = GetSession()->GetAccountId();
+                        std::string const remoteAddress = GetSession()->GetRemoteAddress();
+                        auto const addons = ClusterAddonsFromSession(GetSession()->GetSecureAddons());
+                        uint32 const saveDispatchMs = getMSTime();
+                        GetSession()->AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(trans))
+                            .AfterComplete([guid, dest, destLoc, token, accountId, remoteAddress, addons, saveDispatchMs](bool success)
+                        {
+                            TC_LOG_INFO("server.worldserver", "Cluster handoff: save commit for {} took {} ms (success={})",
+                                        guid.ToString(), GetMSTimeDiffToNow(saveDispatchMs), success);
+
+                            Player* player = ObjectAccessor::FindConnectedPlayer(guid);
+                            if (!success || !player)
+                            {
+                                TC_LOG_ERROR("server.worldserver",
+                                          "Cross-node teleport of {} to node {} not published: {}",
+                                          guid.ToString(), dest.nodeId,
+                                          success ? "player gone" : "pre-teleport save failed");
+                                return;
+                            }
+
+                            // Ship full player state to the destination via NATS.
+                            // The position fields are overridden with the teleport
+                            // destination so the dest node spawns at the target, not
+                            // the stale source coordinates.  Must be published BEFORE
+                            // the redirect token: both go to the same node subject, so
+                            // NATS delivers them in order, and the destination's
+                            // WorldSocket admits the session as soon as the token is
+                            // present.
+                            sNatsBus.SendPlayerTransferForRedirect(player, dest.nodeId, destLoc);
+                            sNatsBus.PublishRedirectToken(accountId, guid.GetRawValue(), token,
+                                                          dest.nodeId, remoteAddress, addons);
+                        });
+                    }
+                    else
+                        CharacterDatabase.CommitTransaction(trans);
+                }
+
+                // Semaphore up immediately after queuing the commit — blocks any
+                // periodic SaveToDB from racing the async transaction.
+                SetSemaphoreTeleportFar(true);
+
+                if (destNode && token != 0)
+                {
+                    auto [redirectIp, redirectPort] = sClusterMgr.GetRedirectAddressForNode(
+                        destNode->nodeId, GetSession()->GetRemoteAddress());
+
+                    // Send SMSG_NEW_WORLD to put client into loading screen state.
+                    // World destination coordinates (not transport-relative), as AC does.
+                    {
+                        WorldPackets::Movement::NewWorld packet;
+                        packet.MapID = mapid;
+                        packet.Pos = m_teleport_dest.GetPosition();
+                        SendDirectMessage(packet.Write());
+                    }
+
+                    // Send SMSG_REDIRECT_CLIENT — client opens second connection to dest
+                    ClientRedirect::RedirectClient(GetSession(), redirectIp, redirectPort, token);
+
+                    // Send SMSG_SUSPEND_COMMS (0x50F) on the SOURCE (current) connection.
+                    // RE of Wow.exe 12340 at 0x633020 confirmed: the client's 0x50F
+                    // handler REQUIRES the packet on the MAIN connection — it checks
+                    // [this+0x2E38] and drops non-main.  The DESTINATION node sends
+                    // only SMSG_FORCE_SEND_QUEUED_PACKETS (0x511) to complete the switch.
+                    ClientRedirect::SuspendClient(GetSession());
+
+                    // Same as the zone and cold-login paths: from here on this
+                    // session is a migration in progress, not a player. Nothing
+                    // more is sent on the suspended connection, nothing the
+                    // client still sends here is processed, the stale-session
+                    // cleanup leaves it alone when the destination announces
+                    // the player, and logout takes the redirect-out teardown
+                    // (no second save, no offline announcement).
+                    GetSession()->SetRedirectedOut();
+
+                    // For group/raid cross-node entry: relay reroute to remote member nodes
+                    // so the whole group lands on the same instance node together.
+                    // Must be inside the destNode block — no point relaying if we couldn't
+                    // resolve a destination ourselves.
+                    if (Group* grp = GetGroup())
+                    {
+                        uint64 myGuid  = GetGUID().GetRawValue();
+                        uint64 grpGuid = grp->GetGUID().GetRawValue();
+                        for (auto const& member : sClusterMgr.GetGroupRemoteMembers(grpGuid))
+                        {
+                            if (member.guid == myGuid)
+                                continue;
+                            std::vector<uint8> payload(12);
+                            std::memcpy(payload.data(),     &member.guid, 8);
+                            std::memcpy(payload.data() + 8, &mapid,       4);
+                            sNatsBus.RelayToNode(member.nodeId,
+                                                     NatsBus::GROUP_INNER_REROUTE_TO_MAP,
+                                                     payload);
+                        }
+                    }
+                }
+                else
+                {
+                    TC_LOG_WARN("server.worldserver",
+                             "Player::TeleportTo: {} for map {} -- cannot reroute player {}",
+                             destNode ? "redirect token generation failed" : "no node info",
+                             mapid, GetGUID().ToString());
+                }
+
+                // Detach from the source transport AFTER the snapshot and
+                // client-facing packets have been sent.
+                //
+                // RemovePassenger() removes `this` from the transport's
+                // _passengers set, preventing a use-after-free on the next
+                // Transport::Update tick once the session is torn down.
+                //
+                // CRITICAL: do NOT null m_transport here.
+                // Map::RemoveFromMap<Transport> — called moments later when the
+                // transport moves to the new map — sends SMSG_DESTROY_OBJECT to
+                // every player on this map whose GetTransport() != this_transport.
+                // That skip exists precisely for passengers.  If we null
+                // m_transport first, GetTransport() returns nullptr, the skip is
+                // bypassed, and the client receives DESTROY_OBJECT mid-redirect,
+                // causing a 0xC0000005 access violation.  Keeping m_transport set
+                // until Unit::CleanupsBeforeDelete (which calls
+                // SetTransport(nullptr)) preserves the skip.
+                if (Transport* transport = m_transport)
+                {
+                    transport->RemovePassenger(this);
+                    // m_transport intentionally NOT nulled here — see comment above.
+                    // TC's Transport::RemovePassenger calls SetTransport(nullptr) itself
+                    // (AC's RemovePassenger(p, withAll=false) does not), so put it back.
+                    // WorldObject::CleanupsBeforeDelete's RemovePassenger is then a
+                    // no-op for this non-member and the player dies with the session.
+                    SetTransport(transport);
+                    m_movementInfo.transport.Reset();
+                    m_movementInfo.RemoveMovementFlag(MOVEMENTFLAG_ONTRANSPORT);
+                }
+
+                // Pending movement-change acks are moot: the client is reconnecting elsewhere.
+                PurgeAndApplyPendingMovementChanges(false);
+
+                return true;
+            }
+
+            // Same-node far teleport: remove player from old map now that
+            // we know this is not a cross-node redirect.
+            if (oldmap)
+                oldmap->RemovePlayerFromMap(this, false);
+
+            // players on mount will be dismounted. the speed and height change should not require an ACK and should be applied directly
+            PurgeAndApplyPendingMovementChanges(false);
 
             if (!GetSession()->PlayerLogout())
             {
@@ -2532,6 +2968,8 @@ void Player::GiveLevel(uint8 level)
     SendQuestGiverStatusMultiple();
 
     sScriptMgr->OnPlayerLevelChanged(this, oldLevel);
+
+    ClusterBroadcastFull(this);
 }
 
 bool Player::IsMaxLevel() const
@@ -3413,6 +3851,9 @@ void Player::LearnSpell(uint32 spell_id, bool dependent, uint32 fromSkill /*= 0*
                 LearnSpell(itr2->second, false, fromSkill);
         }
     }
+
+    if (!dependent)
+        ClusterBroadcastFull(this);
 }
 
 void Player::RemoveSpell(uint32 spell_id, bool disabled, bool learn_low_rank)
@@ -3796,6 +4237,8 @@ bool Player::ResetTalents(bool involuntarily /*= false*/)
 
     if (involuntarily)
         SendDirectMessage(WorldPackets::Talent::TalentsInvoluntarilyReset(false).Write());
+
+    ClusterBroadcastFull(this);
 
     return true;
 }
@@ -4451,6 +4894,8 @@ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
             }
         }
     }
+
+    ClusterBroadcastFull(this);
 }
 
 void Player::RemoveGhoul()
@@ -4487,6 +4932,8 @@ void Player::KillPlayer()
 
     // update visibility
     UpdateObjectVisibility();
+
+    ClusterBroadcastFull(this);
 }
 
 void Player::OfflineResurrect(ObjectGuid const& guid, CharacterDatabaseTransaction trans)
@@ -6811,9 +7258,137 @@ void Player::UpdateArea(uint32 newArea)
         RemoveRestFlag(REST_FLAG_IN_FACTION_AREA);
 }
 
-void Player::UpdateClusterZoneRouting(uint32 /*zoneId*/) { }
+void Player::UpdateClusterZoneRouting(uint32 zoneId)
+{
+    // Cluster: zone-based transfer with hysteresis (dwell timer + cooldown)
+    // Start the dwell timer when entering a non-local zone. The cooldown check
+    // is done when the dwell EXPIRES (in Player::Update), not here — because
+    // UpdateZone only fires on zone change and won't retry if cooldown was active.
+    // Dead players and ghosts stay where they are: the corpse lives on this
+    // node's map, and the transfer carries hit points but no death state, so a
+    // dead player would arrive "alive" with 0 HP (release ignored) and a ghost
+    // would arrive alive with 1 HP. The periodic zone tick re-evaluates once
+    // the player is alive again.
+    if (sClusterMgr.IsEnabled() && !sClusterMgr.IsZoneLocal(zoneId)
+        && sNatsBus.IsConnected() && sClusterMgr.IsMapLocal(GetMapId())
+        && IsAlive()
+        && !IsInCombat() && !IsInFlight() && !HasUnitState(UNIT_STATE_CASTING)
+        && !GetVehicle() && !IsBeingTeleportedFar())
+    {
+        if (m_zoneTransferDwellZone != zoneId)
+        {
+            // Entered a new non-local zone — start dwell timer
+            m_zoneTransferDwellZone = zoneId;
+            m_zoneTransferDwellTimer = ZONE_TRANSFER_DWELL_MS;
+            TC_LOG_INFO("server.worldserver", "Player {} entered non-local zone {} — dwell timer started ({}ms)",
+                     GetName(), zoneId, ZONE_TRANSFER_DWELL_MS);
+        }
+        // Dwell timer is decremented in Player::Update; transfer triggers when it expires
+    }
+    else
+    {
+        // Back in local zone or conditions not met — cancel dwell
+        if (m_zoneTransferDwellZone != 0)
+        {
+            TC_LOG_DEBUG("server.worldserver", "Player {} returned to local zone — dwell cancelled", GetName());
+            m_zoneTransferDwellZone = 0;
+            m_zoneTransferDwellTimer = 0;
+        }
+    }
+}
 
-void Player::BroadcastClusterStateIfDirty(uint32 /*diff*/) { }
+void Player::BroadcastClusterStateIfDirty(uint32 diff)
+{
+    if (!sClusterMgr.IsEnabled() || !sNatsBus.IsConnected())
+        return;
+
+    m_clusterStateBroadcastTimer += diff;
+    if (m_clusterStateBroadcastTimer < CLUSTER_STATE_BROADCAST_INTERVAL)
+        return;
+
+    m_clusterStateBroadcastTimer = 0;
+
+    if (m_clusterDirtyFields == 0)
+        return;
+
+    uint8 dirtyMask = m_clusterDirtyFields;
+    m_clusterDirtyFields = 0;
+
+    // Update the shared cache with current state
+    uint64 playerGuid = GetGUID().GetRawValue();
+    sSharedPlayerCache.UpdateFromPlayer(playerGuid, [this, dirtyMask](SharedPlayerState& s) {
+        s.guid = GetGUID().GetRawValue();
+        s.ownerNodeId = sNatsBus.GetNodeId();
+        s.active = true;
+
+        if (dirtyMask & STATE_FIELD_POSITION)
+        {
+            s.mapId = GetMapId();
+            s.zoneId = GetZoneId();
+            s.areaId = GetAreaId();
+            s.posX = GetPositionX();
+            s.posY = GetPositionY();
+            s.posZ = GetPositionZ();
+            s.posO = GetOrientation();
+        }
+        if (dirtyMask & STATE_FIELD_HEALTH)
+        {
+            s.health = GetHealth();
+            s.maxHealth = GetMaxHealth();
+        }
+        if (dirtyMask & STATE_FIELD_POWER)
+        {
+            s.powerType = GetPowerType();
+            s.power = GetPower(GetPowerType());
+            s.maxPower = GetMaxPower(GetPowerType());
+        }
+        if (dirtyMask & STATE_FIELD_COMBAT)
+        {
+            s.inCombat = IsInCombat();
+            s.inFlight = IsInFlight();
+        }
+        if (dirtyMask & STATE_FIELD_TRANSPORT)
+        {
+            if (Transport* t = GetTransport())
+            {
+                s.transportGuid = t->GetGUID().GetRawValue();
+                s.transportEntry = t->GetEntry();
+                s.transOffX = GetTransOffsetX();
+                s.transOffY = GetTransOffsetY();
+                s.transOffZ = GetTransOffsetZ();
+                s.transOffO = GetTransOffsetO();
+            }
+            else
+            {
+                s.transportGuid = 0;
+                s.transportEntry = 0;
+            }
+        }
+        if (dirtyMask & STATE_FIELD_PET)
+        {
+            if (Pet* pet = GetPet())
+            {
+                s.petEntry = pet->GetEntry();
+                s.petHealth = pet->GetHealth();
+                s.petMana = pet->GetPower(POWER_MANA);
+                s.petName = pet->GetName();
+            }
+            else
+            {
+                s.petEntry = 0;
+            }
+        }
+        if (dirtyMask & STATE_FIELD_DEATH)
+        {
+            s.isDead = isDead();
+        }
+        s.lastUpdateMs = getMSTime();
+        s.lastBroadcastMs = getMSTime();
+    });
+
+    // Broadcast delta to all nodes
+    sNatsBus.BroadcastPlayerStateDelta(playerGuid, dirtyMask);
+}
 
 void Player::UpdateZone(uint32 newZone, uint32 newArea)
 {
@@ -6823,6 +7398,7 @@ void Player::UpdateZone(uint32 newZone, uint32 newArea)
     uint32 const oldZone = m_zoneUpdateId;
     m_zoneUpdateId = newZone;
     m_zoneUpdateTimer = ZONE_UPDATE_INTERVAL;
+    UpdateClusterZoneRouting(newZone);
 
     GetMap()->UpdatePlayerZoneStats(oldZone, newZone);
 
@@ -6906,6 +7482,9 @@ void Player::UpdateZone(uint32 newZone, uint32 newArea)
         if (Guild* guild = GetGuild())
             guild->UpdateMemberData(this, GUILD_MEMBER_DATA_ZONEID, newZone);
     }
+
+    // Cluster: mark position dirty for state broadcast (zone changed)
+    MarkClusterStateDirty(STATE_FIELD_POSITION);
 }
 
 //If players are too far away from the duel flag... they lose the duel
@@ -11918,6 +12497,8 @@ Item* Player::EquipItem(uint16 pos, Item* pItem, bool update)
     // only for full equip instead adding to stack
     UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_EQUIP_ITEM, pItem->GetEntry());
     UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_EQUIP_EPIC_ITEM, slot, pItem->GetEntry());
+
+    ClusterBroadcastFull(this);
 
     return pItem;
 }
@@ -22492,7 +23073,14 @@ void Player::SendInitialPacketsAfterAddToMap()
     GetSession()->ResetTimeSync();
     GetSession()->SendTimeSync();
 
-    CastSpell(this, 836, true);                             // LOGINEFFECT
+    // Cluster: a redirect arrival is a migration, not a real login. The client is
+    // already in-world visually, so the LOGINEFFECT sparkle fires on every zone/map
+    // handoff and breaks the illusion of a seamless transfer. _redirectAutoLoginGuid
+    // is set in WorldSocket during the redirect handshake and stays set until the
+    // end of HandlePlayerLogin (which calls this), so it identifies a redirected
+    // session here.
+    if (!GetSession() || GetSession()->GetRedirectAutoLoginGuid() == 0)
+        CastSpell(this, 836, true);                         // LOGINEFFECT
 
     WorldPacket setCompoundState(SMSG_MULTIPLE_MOVES, 100);
     setCompoundState << uint32(0); // size placeholder
@@ -25032,6 +25620,8 @@ bool Player::LearnTalent(uint32 talentId, uint32 talentRank)
 
     // update free talent points
     SetFreeTalentPoints(CurTalentPoints - (talentRank - curtalent_maxrank + 1));
+
+    ClusterBroadcastFull(this);
     return true;
 }
 
