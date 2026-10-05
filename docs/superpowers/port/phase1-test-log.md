@@ -57,4 +57,6 @@ Audit checklist per test (spec §9): no packet to a redirected-out session; no s
 
 ## Results
 
-(filled in as tests run; one subsection per test with date, commit, character, node log paths and line numbers)
+### 2026-10-05 — map-to-map handoff node 1 → node 2 (teleport path) — PASS (user: "map to map works")
+Commit 704a410128. Character "Split" (guid 1), account gmaccount. Node 1 `~/tc-335/logs/Server.log`:635-637 — `Sent SMSG_CONNECT_TO to Split -> 192.0.2.21:8085`, `Sent SMSG_SUSPEND_COMMS`, `save commit … took 89 ms (success=true)`. Node 2 `Server.log`:576-583 — proof received from 192.0.2.1, token not yet present, `validated redirect token … (waited 59ms)`, authenticated via redirect, `auto-login guid 0x1`. No kick, no AntiDOS, no WARN on any node. Latency data for register item 11: commit 89 ms, destination wait 59 ms.
+
