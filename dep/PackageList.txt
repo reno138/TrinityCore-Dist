@@ -72,3 +72,7 @@ catch2
 short_alloc (Stack based allocator) https://howardhinnant.github.io/stack_alloc.html
   https://howardhinnant.github.io/short_alloc.h
   Version: N/A
+
+cnats (NATS C client, cluster control-channel transport)
+  https://github.com/nats-io/nats.c
+  Version: v3.8.0

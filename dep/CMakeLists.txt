@@ -33,6 +33,32 @@ if(SERVERS)
   add_subdirectory(gsoap)
 endif()
 
+if(SERVERS)
+  # NATS C client (cluster control-channel transport), vendored at dep/cnats (nats.c 3.8.0).
+  # Static only, no TLS/streaming/examples; EXCLUDE_FROM_ALL keeps its install() rules out
+  # of ${CMAKE_INSTALL_PREFIX}. BUILD_TESTING is saved/restored as a directory-scoped
+  # variable so cnats' enable_testing() cannot switch off TrinityCore's own Catch2 suite.
+  set(NATS_BUILD_EXAMPLES   OFF CACHE BOOL "" FORCE)
+  set(NATS_BUILD_LIB_SHARED OFF CACHE BOOL "" FORCE)
+  set(NATS_BUILD_LIB_STATIC ON  CACHE BOOL "" FORCE)
+  set(NATS_BUILD_STREAMING  OFF CACHE BOOL "" FORCE)
+  set(NATS_BUILD_WITH_TLS   OFF CACHE BOOL "" FORCE)
+  set(_tc_saved_build_testing "${BUILD_TESTING}")
+  set(BUILD_TESTING OFF)
+  add_subdirectory(cnats EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING "${_tc_saved_build_testing}")
+  if(TARGET nats_static)
+    # nats.c forces -std=c99 but uses C11 _Generic; the later flag wins.
+    if(NOT MSVC)
+      target_compile_options(nats_static PRIVATE -std=c11)
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+      target_compile_options(nats_static PRIVATE -Wno-incompatible-pointer-types-discards-qualifiers)
+    endif()
+    set_target_properties(nats_static PROPERTIES FOLDER "dep")
+  endif()
+endif()
+
 if(SERVERS AND BUILD_EFSW)
   add_subdirectory(efsw)
 endif()
