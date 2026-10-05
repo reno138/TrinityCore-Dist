@@ -4222,7 +4222,8 @@ InstanceServer.Port = 8087
 ###################################################################################################
 # CLUSTER SERVER
 #
-# Cluster mode is always on in this build — there is no master enable flag.
+# Clustering is enabled when ClusterServer.NodeId is greater than 0. NodeId = 0 runs a
+# stock standalone worldserver (no NATS, no redirects).
 # A worldserver becomes a cluster participant by virtue of having a NodeId
 # and a reachable NatsURL. Set ClusterServer.Maps = "" and run a single node
 # for "standalone" behavior (one node owns all maps).
@@ -4380,28 +4381,29 @@ ClusterServer.LFGMasterNode = 1
 
 #
 #    ClusterServer.NodeDeadThreshold
-#        Description: Seconds without a heartbeat before a peer is declared dead. Maps are
+#        Description: Reserved: not read by the current code (dead-node detection uses NodeDeadTimeout).
+#                     Intended meaning: seconds without a heartbeat before a peer is declared dead. Maps are
 #                     removed from the routing table, MSG_NODE_DEAD is broadcast, and the BG
 #                     coordinator is re-elected. The node is automatically restored on its
 #                     next cluster.announce or heartbeat.
-#                     Must be greater than the heartbeat interval (default 10 s).
 #        Default:     30
 
 ClusterServer.NodeDeadThreshold = 30
 
 #
 #    ClusterServer.NodeDeadTimeout
-#        Description: Milliseconds after a node is declared dead before its orphaned maps are
-#                     formally released from the routing table. Gives the dead node a grace
-#                     period to restart before its maps are claimed by another node.
+#        Description: Milliseconds without a heartbeat before a peer is declared dead (and its
+#                     orphaned maps released from the routing table). Shipped value 60000 = 60 s;
+#                     compiled-in default when the key is absent is 3000 ms.
 #        Default:     60000
 
 ClusterServer.NodeDeadTimeout = 60000
 
 #
 #    ClusterServer.HeartbeatInterval
-#        Description: How often (in seconds) this node broadcasts a MSG_NODE_STATUS heartbeat
-#                     to all peers. Peers use this to detect dead nodes via NodeDeadThreshold.
+#        Description: How often (in MILLISECONDS) this node broadcasts a MSG_NODE_STATUS heartbeat
+#                     to all peers (stored as _heartbeatIntervalMs; shipped value 300 = 300 ms).
+#                     Peers use this to detect dead nodes via NodeDeadTimeout.
 #        Default:     300
 
 ClusterServer.HeartbeatInterval = 300

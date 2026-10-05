@@ -462,6 +462,7 @@ private:
     uint16      _gamePort{ 0 };
     std::string _gameAddress;    ///< Own LAN IP (sent in registration so proxy can match it)
     std::string _natsUrl;
+    bool        _initialised = false;
 
     // These flags are written on the world thread and read on the NATS dispatch
     // thread (publish helpers, announce ACK) — atomic so the reads are defined.

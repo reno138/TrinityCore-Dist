@@ -61,6 +61,7 @@
 void NatsBus::Initialize(std::string const& natsUrl, uint8 serverType,
                               uint16 gamePort, std::string const& gameAddress)
 {
+    _initialised    = true;
     _natsUrl        = natsUrl;
     _serverType     = serverType;
     _gamePort       = gamePort;
@@ -1167,6 +1168,9 @@ void NatsBus::RefreshConfigCache()
 
 void NatsBus::Update()
 {
+    if (!_initialised)
+        return;
+
     constexpr uint32 NATS_RETRY_INTERVAL_MS     = 10 * 1000;    //  10 seconds
     constexpr uint32 ANNOUNCE_RETRY_INTERVAL_MS = 10 * 1000;    //  10 seconds
     uint32 const HEARTBEAT_INTERVAL_MS = _heartbeatIntervalMs;

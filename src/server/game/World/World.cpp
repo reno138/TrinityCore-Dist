@@ -2518,7 +2518,8 @@ void World::Update(uint32 diff)
             {
                 TC_LOG_INFO("server.worldserver", "World: Deactivating player {} (GUID {:016X}) -- ownership transferred to another node",
                     player->GetName(), guid);
-                player->RemoveAllAuras();
+                // TC: CleanupsBeforeDelete is mandatory before a Player is deleted (trade/duel/transport back-pointers)
+                player->CleanupsBeforeDelete();
                 if (WorldSession* session = player->GetSession())
                     session->SetPlayer(nullptr);
                 // Do NOT close the socket here. The client may still need the
