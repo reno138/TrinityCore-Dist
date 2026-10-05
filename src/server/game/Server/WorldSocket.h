@@ -63,6 +63,7 @@ struct ClientPktHeader
 #pragma pack(pop)
 
 struct AuthSession;
+struct AccountInfo;
 
 class TC_GAME_API WorldSocket final : public Trinity::Net::Socket<>
 {
@@ -112,6 +113,10 @@ private:
     void HandleAuthSession(WorldPacket& recvPacket);
     void HandleAuthSessionCallback(std::shared_ptr<AuthSession> authSession, PreparedQueryResult result);
     void LoadSessionPermissionsCallback(PreparedQueryResult result);
+    // cluster: destination-side auth for a client redirected here by SMSG_CONNECT_TO
+    void HandleRedirectionAuthProof(WorldPacket& recvPacket);
+    void HandleRedirectionAuthProofCallback(PreparedQueryResult result);
+    void TryCompleteRedirectAuth();
     void SendAuthResponseError(uint8 code);
 
     bool HandlePing(WorldPacket& recvPacket);
@@ -119,6 +124,13 @@ private:
     std::array<uint8, 4> _serverChallenge;
     std::array<uint8, 32> _dosChallenge;
     WorldPacketCrypt _authCrypt;
+
+    // cluster redirect auth state (CMSG_AUTH_CONTINUED_SESSION path)
+    std::string _redirectAccountName;
+    std::unique_ptr<AccountInfo> _redirectAccount;
+    bool _redirectAwaitingToken = false;
+    uint32 _redirectWaitStartMs = 0;
+    bool _isRedirectConn = false;
 
     TimePoint _LastPingTime;
     uint32 _OverSpeedPings;

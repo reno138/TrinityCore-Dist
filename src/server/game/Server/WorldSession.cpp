@@ -25,6 +25,7 @@
 #include "BattlegroundMgr.h"
 #include "CharacterPackets.h"
 #include "ClientConfigPackets.h"
+#include "ClusterMgr.h"
 #include "Config.h"
 #include "Common.h"
 #include "Containers.h"
@@ -42,6 +43,7 @@
 #include "MiscPackets.h"
 #include "MovementPackets.h"
 #include "MoveSpline.h"
+#include "NatsBus.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -50,6 +52,7 @@
 #include "Player.h"
 #include "Realm.h"
 #include "ScriptMgr.h"
+#include "SharedPlayerCache.h"
 #include "SocialMgr.h"
 #include "QueryHolder.h"
 #include "Vehicle.h"
@@ -181,7 +184,9 @@ WorldSession::~WorldSession()
     while (_recvQueue.next(packet))
         delete packet;
 
-    LoginDatabase.PExecute("UPDATE account SET online = 0 WHERE id = {};", GetAccountId());     // One-time query
+    // cluster: a redirected-out session's account is now online on the destination node
+    if (!_redirectedOut)
+        LoginDatabase.PExecute("UPDATE account SET online = 0 WHERE id = {};", GetAccountId());     // One-time query
 }
 
 std::string const & WorldSession::GetPlayerName() const
@@ -207,6 +212,27 @@ void WorldSession::SendPacket(WorldPacket const* packet)
 
     if (!m_Socket)
         return;
+
+    // cluster: the client is switching nodes; anything the old connection sends now
+    // (aura/spell-mod teardown etc.) breaks the redirect
+    if (_redirectedOut)
+        return;
+
+    // cluster: while a redirected-in character is still loading, passive-talent casts
+    // from the login path would animate on the still-visible old-node character
+    if (_redirectAutoLoginGuid && _player && !_player->IsInWorld())
+    {
+        switch (packet->GetOpcode())
+        {
+            case SMSG_SPELL_START:
+            case SMSG_SPELL_GO:
+            case SMSG_PLAY_SPELL_VISUAL:
+            case SMSG_PLAY_SPELL_IMPACT:
+                return;
+            default:
+                break;
+        }
+    }
 
 #ifdef TRINITY_DEBUG
     // Code for network use statistic
@@ -292,7 +318,15 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
 
     constexpr uint32 MAX_PROCESSED_PACKETS_IN_SAME_WORLDSESSION_UPDATE = 100;
 
-    while (m_Socket && _recvQueue.next(packet, updater))
+    // cluster: a redirected-out session only lingers until the client closes the old
+    // connection. Whatever the client still sends here belongs to the destination node;
+    // handling it (or letting AntiDOS kick the session and close the socket under the
+    // client) only disturbs the switch. Discard it.
+    if (_redirectedOut)
+        while (_recvQueue.next(packet, updater))
+            delete packet;
+
+    while (m_Socket && !_redirectedOut && _recvQueue.next(packet, updater))
     {
         OpcodeClient opcode = static_cast<OpcodeClient>(packet->GetOpcode());
         ClientOpcodeHandler const* opHandle = opcodeTable[opcode];
@@ -482,9 +516,43 @@ bool WorldSession::Update(uint32 diff, PacketFilter& updater)
 /// %Log the player out
 void WorldSession::LogoutPlayer(bool save)
 {
+    // cluster: redirect-out fast path. The player now lives on another node: this is a
+    // session migration, not a logout. No SaveToDB (the destination has the state), no
+    // offline announce / friend status / guild / group / BG cleanup, no account or
+    // character online-flag clear. Only tear down the local Player object.
+    if (_redirectedOut && _player)
+    {
+        TC_LOG_INFO("server.worldserver", "LogoutPlayer: {} redirected out, tearing down without save", _player->GetName());
+
+        _player->CleanupsBeforeDelete();
+        if (Map* _map = _player->FindMap())
+            _map->RemovePlayerFromMap(_player, true);
+
+        SetPlayer(nullptr); //! Pointer already deleted during RemovePlayerFromMap
+
+        m_playerLogout = false;
+        m_playerSave = false;
+        m_playerRecentlyLogout = true;
+        SetLogoutStartTime(0);
+        return;
+    }
+
+    // cluster: if the pending far teleport goes to a map another node hosts,
+    // HandleMoveWorldportAck() cannot create the destination map here. TeleportTo already
+    // persisted the destination position, so clear the semaphore and skip the worldport
+    // ack and the full save (which would overwrite it with the old position).
+    bool crossNodeReroute = false;
+    if (_player && _player->IsBeingTeleportedFar()
+        && sNatsBus.IsConnected() && !sClusterMgr.IsMapLocal(_player->GetTeleportDest().GetMapId()))
+    {
+        crossNodeReroute = true;
+        _player->SetSemaphoreTeleportFar(false);
+    }
+
     // finish pending transfers before starting the logout
-    while (_player && _player->IsBeingTeleportedFar())
-        HandleMoveWorldportAck();
+    if (!crossNodeReroute)
+        while (_player && _player->IsBeingTeleportedFar())
+            HandleMoveWorldportAck();
 
     m_playerLogout = true;
     m_playerSave = save;
@@ -544,8 +612,9 @@ void WorldSession::LogoutPlayer(bool save)
 
         // Repop at Graveyard or other player far teleport will prevent saving player because of not present map
         // Teleport player immediately for correct player save
-        while (_player->IsBeingTeleportedFar())
-            HandleMoveWorldportAck();
+        if (!crossNodeReroute)
+            while (_player->IsBeingTeleportedFar())
+                HandleMoveWorldportAck();
 
         ///- If the player is in a guild, update the guild roster and broadcast a logout message to other guild members
         if (Guild* guild = sGuildMgr->GetGuildById(_player->GetGuildId()))
@@ -559,7 +628,7 @@ void WorldSession::LogoutPlayer(bool save)
 
         ///- empty buyback items and save the player in the database
         // some save parts only correctly work in case player present in map/player_lists (pets, etc)
-        if (save)
+        if (save && !crossNodeReroute)
         {
             uint32 eslot;
             for (int j = BUYBACK_SLOT_START; j < BUYBACK_SLOT_END; ++j)
@@ -587,6 +656,10 @@ void WorldSession::LogoutPlayer(bool save)
                 group->StartLeaderOfflineTimer();
         }
 
+        // cluster: tell the other nodes so their presence caches drop the player
+        if (sNatsBus.IsConnected())
+            sNatsBus.AnnounceOffline(_player->GetGUID().GetRawValue());
+
         //! Broadcast a logout message to the player's friends
         sSocialMgr->SendFriendStatus(_player, FRIEND_OFFLINE, _player->GetGUID(), true);
         _player->RemoveSocial();
@@ -595,6 +668,13 @@ void WorldSession::LogoutPlayer(bool save)
         sScriptMgr->OnPlayerLogout(_player);
 
         TC_METRIC_EVENT("player_events", "Logout", _player->GetName());
+
+        // cluster: stop cross-node lookups resolving to this node
+        if (sClusterMgr.IsEnabled())
+        {
+            sSharedPlayerCache.Remove(_player->GetGUID().GetRawValue());
+            sClusterMgr.SetPlayerOwner(_player->GetGUID().GetRawValue(), 0);
+        }
 
         //! Remove the player from the world
         // the player may not be in the world when logging out
@@ -1184,6 +1264,17 @@ void WorldSession::InitializeSessionCallback(CharacterDatabaseQueryHolder const&
     SendAddonsInfo();
     SendClientCacheVersion(sWorld->getIntConfig(CONFIG_CLIENTCACHE_VERSION));
     SendTutorialsData();
+
+    // cluster: a client redirected here never sees character select; log the character
+    // in directly. The guid is cleared by the login DB callback, not here (this only
+    // queues the LoginQueryHolder).
+    if (_redirectAutoLoginGuid)
+    {
+        TC_LOG_INFO("server.worldserver", "Redirect arrival: auto-login guid {:#x} for account {}", _redirectAutoLoginGuid, GetAccountId());
+        WorldPacket data(CMSG_PLAYER_LOGIN, 8);
+        data << uint64(_redirectAutoLoginGuid);
+        HandlePlayerLoginOpcode(data);
+    }
 }
 
 rbac::RBACData* WorldSession::GetRBACData() const

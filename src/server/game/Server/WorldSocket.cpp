@@ -32,7 +32,64 @@
 #include "ScriptMgr.h"
 #include "World.h"
 #include "WorldSession.h"
+#include "ClusterMgr.h"
+#include "IpAddress.h"
+#include "PacketTrace.h"
 #include <memory>
+
+// Defined before the WorldSocket ctor/dtor: the redirect path holds a
+// std::unique_ptr<AccountInfo> member, which needs the complete type there.
+struct AccountInfo
+{
+    uint32 Id;
+    ::SessionKey SessionKey;
+    std::string LastIP;
+    bool IsLockedToIP;
+    std::string LockCountry;
+    uint8 Expansion;
+    int64 MuteTime;
+    LocaleConstant Locale;
+    uint32 Recruiter;
+    std::string OS;
+    Minutes TimezoneOffset;
+    bool IsRectuiter;
+    AccountTypes Security;
+    bool IsBanned;
+
+    explicit AccountInfo(Field const* fields)
+    {
+        //           0             1          2         3               4            5           6         7            8     9                 10                11
+        // SELECT a.id, a.sessionkey, a.last_ip, a.locked, a.lock_country, a.expansion, a.mutetime, a.locale, a.recruiter, a.os, a.timezone_offset, aa.SecurityLevel,
+        //                                                           12    13
+        // ab.unbandate > UNIX_TIMESTAMP() OR ab.unbandate = ab.bandate, r.id
+        // FROM account a
+        // LEFT JOIN account_access aa ON a.id = aa.AccountID AND aa.RealmID IN (-1, ?)
+        // LEFT JOIN account_banned ab ON a.id = ab.id
+        // LEFT JOIN account r ON a.id = r.recruiter
+        // WHERE a.username = ? ORDER BY aa.RealmID DESC LIMIT 1
+        Id = fields[0].GetUInt32();
+        SessionKey = fields[1].GetBinary<SESSION_KEY_LENGTH>();
+        LastIP = fields[2].GetString();
+        IsLockedToIP = fields[3].GetBool();
+        LockCountry = fields[4].GetString();
+        Expansion = fields[5].GetUInt8();
+        MuteTime = fields[6].GetInt64();
+        Locale = LocaleConstant(fields[7].GetUInt8());
+        Recruiter = fields[8].GetUInt32();
+        OS = fields[9].GetString();
+        TimezoneOffset = Minutes(fields[10].GetInt16());
+        Security = AccountTypes(fields[11].GetUInt8());
+        IsBanned = fields[12].GetUInt64() != 0;
+        IsRectuiter = fields[13].GetUInt32() != 0;
+
+        uint32 world_expansion = sWorld->getIntConfig(CONFIG_EXPANSION);
+        if (Expansion > world_expansion)
+            Expansion = world_expansion;
+
+        if (Locale >= TOTAL_LOCALES)
+            Locale = LOCALE_enUS;
+    }
+};
 
 WorldSocket::WorldSocket(Trinity::Net::IoContextTcpSocket&& socket) : BaseSocket(std::move(socket)), _OverSpeedPings(0), _worldSession(nullptr), _authed(false), _sendBufferSize(4096)
 {
@@ -72,6 +129,10 @@ void WorldSocket::Start()
 
 bool WorldSocket::Update()
 {
+    // cluster: a redirect auth parked waiting on its NATS token retries every socket tick
+    if (_redirectAwaitingToken)
+        TryCompleteRedirectAuth();
+
     EncryptablePacket* queued;
     if (_bufferQueue.Dequeue(queued))
     {
@@ -242,58 +303,6 @@ struct AuthSession
     ByteBuffer AddonInfo;
 };
 
-struct AccountInfo
-{
-    uint32 Id;
-    ::SessionKey SessionKey;
-    std::string LastIP;
-    bool IsLockedToIP;
-    std::string LockCountry;
-    uint8 Expansion;
-    int64 MuteTime;
-    LocaleConstant Locale;
-    uint32 Recruiter;
-    std::string OS;
-    Minutes TimezoneOffset;
-    bool IsRectuiter;
-    AccountTypes Security;
-    bool IsBanned;
-
-    explicit AccountInfo(Field const* fields)
-    {
-        //           0             1          2         3               4            5           6         7            8     9                 10                11
-        // SELECT a.id, a.sessionkey, a.last_ip, a.locked, a.lock_country, a.expansion, a.mutetime, a.locale, a.recruiter, a.os, a.timezone_offset, aa.SecurityLevel,
-        //                                                           12    13
-        // ab.unbandate > UNIX_TIMESTAMP() OR ab.unbandate = ab.bandate, r.id
-        // FROM account a
-        // LEFT JOIN account_access aa ON a.id = aa.AccountID AND aa.RealmID IN (-1, ?)
-        // LEFT JOIN account_banned ab ON a.id = ab.id
-        // LEFT JOIN account r ON a.id = r.recruiter
-        // WHERE a.username = ? ORDER BY aa.RealmID DESC LIMIT 1
-        Id = fields[0].GetUInt32();
-        SessionKey = fields[1].GetBinary<SESSION_KEY_LENGTH>();
-        LastIP = fields[2].GetString();
-        IsLockedToIP = fields[3].GetBool();
-        LockCountry = fields[4].GetString();
-        Expansion = fields[5].GetUInt8();
-        MuteTime = fields[6].GetInt64();
-        Locale = LocaleConstant(fields[7].GetUInt8());
-        Recruiter = fields[8].GetUInt32();
-        OS = fields[9].GetString();
-        TimezoneOffset = Minutes(fields[10].GetInt16());
-        Security = AccountTypes(fields[11].GetUInt8());
-        IsBanned = fields[12].GetUInt64() != 0;
-        IsRectuiter = fields[13].GetUInt32() != 0;
-
-        uint32 world_expansion = sWorld->getIntConfig(CONFIG_EXPANSION);
-        if (Expansion > world_expansion)
-            Expansion = world_expansion;
-
-        if (Locale >= TOTAL_LOCALES)
-            Locale = LOCALE_enUS;
-    }
-};
-
 WorldSocket::ReadDataHandlerResult WorldSocket::ReadDataHandler()
 {
     ClientPktHeader* header = reinterpret_cast<ClientPktHeader*>(_headerBuffer.GetReadPointer());
@@ -304,6 +313,16 @@ WorldSocket::ReadDataHandlerResult WorldSocket::ReadDataHandler()
 
     if (sPacketLog->CanLogPacket())
         sPacketLog->LogPacket(packet, CLIENT_TO_SERVER, GetRemoteIpAddress(), GetRemotePort());
+
+    if (PT_ENABLED())
+    {
+        std::string who = GetRemoteIpAddress().to_string();
+        std::uint32_t const op = static_cast<std::uint32_t>(opcode);
+        if (Trinity::PacketTrace::IsCriticalOpcodeForTrace(op))
+            PT_OPCODE_HEX("C>S", op, packet.empty() ? nullptr : packet.contents(), packet.size(), who, 256);
+        else
+            PT_OPCODE("C>S", op, packet.size(), who);
+    }
 
     std::unique_lock<std::mutex> sessionGuard(_worldSessionLock, std::defer_lock);
 
@@ -320,6 +339,31 @@ WorldSocket::ReadDataHandlerResult WorldSocket::ReadDataHandler()
             {
             }
             TC_LOG_ERROR("network", "WorldSocket::ReadDataHandler(): client {} sent malformed CMSG_PING", GetRemoteIpAddress().to_string());
+            return ReadDataHandlerResult::Error;
+        }
+        case CMSG_SUSPEND_COMMS_ACK:
+            packet.rfinish();
+            return ReadDataHandlerResult::Ok;
+        case CMSG_AUTH_CONTINUED_SESSION:
+        {
+            // cluster: a client redirected here from another node (SMSG_CONNECT_TO) sends this
+            // instead of CMSG_AUTH_SESSION on its new connection
+            LogOpcodeText(opcode, sessionGuard);
+            if (_authed)
+            {
+                TC_LOG_ERROR("network", "WorldSocket::ReadDataHandler: received duplicate CMSG_AUTH_CONTINUED_SESSION from {}", GetRemoteIpAddress().to_string());
+                return ReadDataHandlerResult::Error;
+            }
+
+            try
+            {
+                HandleRedirectionAuthProof(packet);
+                return ReadDataHandlerResult::WaitingForQuery;
+            }
+            catch (ByteBufferException const&)
+            {
+            }
+            TC_LOG_ERROR("network", "WorldSocket::ReadDataHandler: malformed CMSG_AUTH_CONTINUED_SESSION from {}", GetRemoteIpAddress().to_string());
             return ReadDataHandlerResult::Error;
         }
         case CMSG_AUTH_SESSION:
@@ -416,6 +460,16 @@ void WorldSocket::SendPacket(WorldPacket const& packet)
 
     if (sPacketLog->CanLogPacket())
         sPacketLog->LogPacket(packet, SERVER_TO_CLIENT, GetRemoteIpAddress(), GetRemotePort());
+
+    if (PT_ENABLED())
+    {
+        std::string who = GetRemoteIpAddress().to_string();
+        std::uint32_t const op = static_cast<std::uint32_t>(packet.GetOpcode());
+        if (Trinity::PacketTrace::IsCriticalOpcodeForTrace(op))
+            PT_OPCODE_HEX("S>C", op, packet.empty() ? nullptr : packet.contents(), packet.size(), who, 256);
+        else
+            PT_OPCODE("S>C", op, packet.size(), who);
+    }
 
     _bufferQueue.Enqueue(new EncryptablePacket(packet, _authCrypt.IsInitialized()));
 }
@@ -613,10 +667,235 @@ void WorldSocket::HandleAuthSessionCallback(std::shared_ptr<AuthSession> authSes
         account.Recruiter, account.IsRectuiter);
     _worldSession->ReadAddonsInfo(authSession->AddonInfo);
 
+    // cluster: session-side copies ClientRedirect uses to sign SMSG_CONNECT_TO
+    _worldSession->SetSessionKey(account.SessionKey);
+    _worldSession->SetAuthSeed(_serverChallenge);
+
     // Initialize Warden system only if it is enabled by config
     if (wardenActive)
         _worldSession->InitWarden(account.SessionKey, account.OS);
 
+    QueueQuery(_worldSession->LoadPermissionsAsync().WithPreparedCallback(std::bind(&WorldSocket::LoadSessionPermissionsCallback, this, std::placeholders::_1)));
+    AsyncRead(Trinity::Net::InvokeReadHandlerCallback<WorldSocket>{ .Socket = this });
+}
+
+// ---------------------------------------------------------------------------
+// cluster: destination-side redirect authentication.
+//
+// A client redirected here by another node (SMSG_CONNECT_TO) opens a fresh
+// connection, receives the normal SMSG_AUTH_CHALLENGE from SendAuthSession()
+// and answers with CMSG_AUTH_CONTINUED_SESSION instead of CMSG_AUTH_SESSION.
+// The 3.3.5a client never echoes the redirect token, so the proof bytes are
+// ignored: the pending-redirect entry the source node published over NATS
+// (bound to the client address) is the credential.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    /// How long to hold a redirect connection waiting for its NATS token before
+    /// giving up. The token is published by the source node immediately before it
+    /// sends SMSG_CONNECT_TO, so it is already in flight when we get here.
+    constexpr uint32 REDIRECT_TOKEN_WAIT_MS = 3000;
+
+    /// Per-connection redirect keys: HMAC-SHA1(dosChallenge[0..15], K) encrypts
+    /// server->client, HMAC-SHA1(dosChallenge[16..31], K) decrypts client->server.
+    /// TC's three-argument WorldPacketCrypt::Init is exactly AC's InitRedirect.
+    void InitRedirectCrypt(WorldPacketCrypt& crypt, SessionKey const& sessionKey, std::array<uint8, 32> const& dosChallenge)
+    {
+        crypt.Init(sessionKey,
+            std::span<uint8 const, 16>(dosChallenge.data(), 16),
+            std::span<uint8 const, 16>(dosChallenge.data() + 16, 16));
+    }
+}
+
+void WorldSocket::HandleRedirectionAuthProof(WorldPacket& recvPacket)
+{
+    // CMSG_AUTH_CONTINUED_SESSION: string accountName, then two uint32 and a
+    // 20-byte SHA1 proof that the client does not derive from anything we can
+    // verify. Only the account name is used.
+    std::string accountName;
+    recvPacket >> accountName;
+    recvPacket.rfinish();
+
+    TC_LOG_INFO("network", "WorldSocket::HandleRedirectionAuthProof: account '{}' from {}", accountName, GetRemoteIpAddress().to_string());
+
+    // Same account query as HandleAuthSession
+    LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_ACCOUNT_INFO_BY_NAME);
+    stmt->setInt32(0, int32(realm.Id.Realm));
+    stmt->setString(1, accountName);
+
+    _redirectAccountName = std::move(accountName);
+
+    QueueQuery(LoginDatabase.AsyncQuery(stmt).WithPreparedCallback(std::bind(&WorldSocket::HandleRedirectionAuthProofCallback, this, std::placeholders::_1)));
+}
+
+void WorldSocket::HandleRedirectionAuthProofCallback(PreparedQueryResult result)
+{
+    if (!result)
+    {
+        SendAuthResponseError(AUTH_UNKNOWN_ACCOUNT);
+        TC_LOG_ERROR("network", "WorldSocket::HandleRedirectionAuthProof: unknown account '{}'", _redirectAccountName);
+        DelayedCloseSocket();
+        return;
+    }
+
+    _redirectAccount = std::make_unique<AccountInfo>(result->Fetch());
+    AccountInfo const& account = *_redirectAccount;
+    std::string address = GetRemoteIpAddress().to_string();
+
+    // Same ban / IP-lock / country-lock checks as HandleAuthSessionCallback. On
+    // failure the crypt is initialised first (with the redirect keys this
+    // connection would use) so the client can read the auth response error.
+    auto reject = [&](uint8 code)
+    {
+        InitRedirectCrypt(_authCrypt, account.SessionKey, _dosChallenge);
+        SendAuthResponseError(code);
+        sScriptMgr->OnFailedAccountLogin(account.Id);
+        _redirectAccount.reset();
+        DelayedCloseSocket();
+    };
+
+    if (IpLocationRecord const* location = sIPLocation->GetLocationRecord(address))
+        _ipCountry = location->CountryCode;
+
+    if (account.IsLockedToIP)
+    {
+        if (account.LastIP != address)
+        {
+            TC_LOG_DEBUG("network", "WorldSocket::HandleRedirectionAuthProof: account IP differs (original {}, new {})", account.LastIP, address);
+            reject(AUTH_FAILED);
+            return;
+        }
+    }
+    else if (!account.LockCountry.empty() && account.LockCountry != "00" && !_ipCountry.empty())
+    {
+        if (account.LockCountry != _ipCountry)
+        {
+            TC_LOG_DEBUG("network", "WorldSocket::HandleRedirectionAuthProof: account country differs (original {}, new {})", account.LockCountry, _ipCountry);
+            reject(AUTH_FAILED);
+            return;
+        }
+    }
+
+    if (account.IsBanned)
+    {
+        TC_LOG_ERROR("network", "WorldSocket::HandleRedirectionAuthProof: account {} is banned", account.Id);
+        reject(AUTH_BANNED);
+        return;
+    }
+
+    _redirectWaitStartMs = getMSTime();
+    TryCompleteRedirectAuth();
+}
+
+void WorldSocket::TryCompleteRedirectAuth()
+{
+    if (!_redirectAccount)
+    {
+        _redirectAwaitingToken = false;
+        return;
+    }
+
+    // Client gave up while we were parked: do not consume its token for a dead socket.
+    if (!IsOpen())
+    {
+        _redirectAwaitingToken = false;
+        _redirectAccount.reset();
+        return;
+    }
+
+    AccountInfo const& account = *_redirectAccount;
+
+    // Consume the pending redirect for this account. The entry is bound to the
+    // client address the source node saw; a socket from anywhere else is
+    // refused and the entry is left for the real client.
+    std::optional<ClusterMgr::PendingRedirect> redirect = sClusterMgr.TakePendingRedirect(account.Id, GetRemoteIpAddress().to_string());
+    if (!redirect)
+    {
+        // The client's TCP reconnect can outrun the token's NATS delivery. Do NOT
+        // fall through without a GUID: that authenticates the session but never
+        // fires the auto-login, leaving the client on a finished loading screen
+        // forever. Hold the connection briefly and retry from Update() instead.
+        if (GetMSTimeDiffToNow(_redirectWaitStartMs) < REDIRECT_TOKEN_WAIT_MS)
+        {
+            if (!_redirectAwaitingToken)
+            {
+                _redirectAwaitingToken = true;
+                TC_LOG_INFO("network", "WorldSocket::TryCompleteRedirectAuth: token for account {} ({}) not here yet - waiting up to {}ms",
+                    account.Id, _redirectAccountName, REDIRECT_TOKEN_WAIT_MS);
+            }
+            return;
+        }
+
+        TC_LOG_ERROR("network", "WorldSocket::TryCompleteRedirectAuth: no redirect token for account {} ({}) after {}ms - closing",
+            account.Id, _redirectAccountName, REDIRECT_TOKEN_WAIT_MS);
+        _redirectAwaitingToken = false;
+        InitRedirectCrypt(_authCrypt, account.SessionKey, _dosChallenge);
+        SendAuthResponseError(AUTH_FAILED);
+        _redirectAccount.reset();
+        DelayedCloseSocket();
+        return;
+    }
+
+    _redirectAwaitingToken = false;
+    uint64 const redirectPlayerGuid = redirect->playerGuid;
+    TC_LOG_INFO("network", "WorldSocket::TryCompleteRedirectAuth: validated redirect token for account {} guid {:016X} (waited {}ms)",
+        account.Id, redirectPlayerGuid, GetMSTimeDiffToNow(_redirectWaitStartMs));
+
+    // Per-connection redirect keys, then SMSG_RESUME_COMMS (AC: SMSG_FORCE_SEND_QUEUED_PACKETS)
+    // on THIS socket: it makes the client promote the redirect connection to main,
+    // clear its suspend flag and flush queued messages. SMSG_SUSPEND_COMMS was already
+    // sent by the source node on the old connection and must never be sent here.
+    InitRedirectCrypt(_authCrypt, account.SessionKey, _dosChallenge);
+    {
+        WorldPacket resume(SMSG_RESUME_COMMS, 0);
+        SendPacketAndLogOpcode(resume);
+    }
+
+    int64 mutetime = account.MuteTime;
+    //! Negative mutetime indicates amount of seconds to be muted effective on next login - which is now.
+    if (mutetime < 0)
+    {
+        mutetime = GameTime::GetGameTime() + std::llabs(mutetime);
+
+        LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_MUTE_TIME_LOGIN);
+        stmt->setInt64(0, mutetime);
+        stmt->setUInt32(1, account.Id);
+        LoginDatabase.Execute(stmt);
+    }
+
+    // No CMSG_AUTH_SESSION ever arrives on this socket: build the session here.
+    // SMSG_AUTH_RESPONSE / addon info / cache version / tutorials are sent by
+    // InitializeSession once the session is added. Warden is skipped (as AC):
+    // SMSG_WARDEN_DATA confuses the client during the redirect.
+    _worldSession = new WorldSession(account.Id, std::move(_redirectAccountName),
+        static_pointer_cast<WorldSocket>(shared_from_this()), account.Security, account.Expansion, mutetime,
+        account.TimezoneOffset, account.Locale,
+        account.Recruiter, account.IsRectuiter);
+    _worldSession->SetSessionKey(account.SessionKey);
+    _worldSession->SetAuthSeed(_serverChallenge);
+    // Addon list from the source session, carried in the token, so SendAddonsInfo
+    // answers per-addon instead of with an empty list.
+    _worldSession->SetSecureAddons(SessionAddonsFromCluster(redirect->addons));
+
+    // Auto-login: InitializeSessionCallback synthesises CMSG_PLAYER_LOGIN for this
+    // guid; HandlePlayerLoginOpcode requires it to be a legit character first.
+    if (redirectPlayerGuid != 0)
+    {
+        _worldSession->AddLegitCharacter(GuidFromRaw(redirectPlayerGuid));
+        _worldSession->SetRedirectAutoLoginGuid(redirectPlayerGuid);
+    }
+
+    _authed = true;
+    _isRedirectConn = true;
+
+    TC_LOG_INFO("network", "WorldSocket::TryCompleteRedirectAuth: account {} authenticated via redirect from {}",
+        account.Id, GetRemoteIpAddress().to_string());
+
+    _redirectAccount.reset();
+
+    // RBAC must be loaded before the session is added (World::AddSession_ checks
+    // RBAC_PERM_SKIP_QUEUE, then InitializeSession fires the auto-login).
     QueueQuery(_worldSession->LoadPermissionsAsync().WithPreparedCallback(std::bind(&WorldSocket::LoadSessionPermissionsCallback, this, std::placeholders::_1)));
     AsyncRead(Trinity::Net::InvokeReadHandlerCallback<WorldSocket>{ .Socket = this });
 }
