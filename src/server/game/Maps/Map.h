@@ -466,6 +466,8 @@ class TC_GAME_API Map : public GridRefManager<NGridType>
 
         typedef MapRefManager PlayerList;
         PlayerList const& GetPlayers() const { return m_mapRefManager; }
+        bool IsGhostMap() const { return _ghostMap; }
+        void SetGhostMap() { _ghostMap = true; }
 
         //per-map script storage
         void ScriptsStart(std::map<uint32, std::multimap<uint32, ScriptInfo>> const& scripts, uint32 id, Object* source, Object* target);
@@ -878,6 +880,7 @@ class TC_GAME_API Map : public GridRefManager<NGridType>
         std::unordered_set<Corpse*> _corpseBones;
 
         std::unordered_set<Object*> _updateObjects;
+        bool _ghostMap = false;
 
         MPSCQueue<FarSpellCallback> _farSpellCallbacks;
 };

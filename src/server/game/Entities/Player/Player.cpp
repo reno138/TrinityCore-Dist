@@ -6811,6 +6811,10 @@ void Player::UpdateArea(uint32 newArea)
         RemoveRestFlag(REST_FLAG_IN_FACTION_AREA);
 }
 
+void Player::UpdateClusterZoneRouting(uint32 /*zoneId*/) { }
+
+void Player::BroadcastClusterStateIfDirty(uint32 /*diff*/) { }
+
 void Player::UpdateZone(uint32 newZone, uint32 newArea)
 {
     if (!IsInWorld())

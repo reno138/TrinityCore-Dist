@@ -32,6 +32,8 @@
 #include "Packet.h"
 #include "SharedDefines.h"
 #include <boost/circular_buffer_fwd.hpp>
+#include <array>
+#include <vector>
 #include <string>
 #include <map>
 #include <memory>
@@ -58,6 +60,7 @@ struct ItemTemplate;
 struct MovementInfo;
 struct Petition;
 struct TradeStatusInfo;
+struct TransferPetInfo;
 enum AuctionCommand : uint8;
 enum AuctionResult : uint8;
 enum InventoryResult : uint8;
@@ -576,6 +579,50 @@ class TC_GAME_API WorldSession
         void InitWarden(SessionKey const& k, std::string const& os);
         Warden* GetWarden() { return _warden.get(); }
         Warden const* GetWarden() const { return _warden.get(); }
+
+        // ---- cluster port: redirect / handoff state ----
+        void SetSessionKey(SessionKey const& k) { _clusterSessionKey = k; }
+        SessionKey const& GetSessionKey() const { return _clusterSessionKey; }
+        void SetAuthSeed(std::array<uint8, 4> const& s) { _clusterAuthSeed = s; }
+        std::array<uint8, 4> const& GetAuthSeed() const { return _clusterAuthSeed; }
+        void SetRedirectAutoLoginGuid(uint64 g) { _redirectAutoLoginGuid = g; }
+        uint64 GetRedirectAutoLoginGuid() const { return _redirectAutoLoginGuid; }
+        void SetRedirectedOut() { _redirectedOut = true; }
+        bool IsRedirectedOut() const { return _redirectedOut; }
+        void SetRedirectPending() { m_redirectPending = true; }
+        bool IsRedirectPending() const { return m_redirectPending; }
+        void AddLegitCharacter(ObjectGuid guid) { _legitCharacters.insert(guid); }
+
+        struct Addons
+        {
+            static uint32 constexpr MaxSecureAddons = 25;
+
+            std::vector<SecureAddonInfo> SecureAddons;
+            uint32 LastBannedAddOnTimestamp = 0;
+        };
+        std::vector<SecureAddonInfo> const& GetSecureAddons() const { return _addons.SecureAddons; }
+        void SetSecureAddons(std::vector<SecureAddonInfo> addons) { _addons.SecureAddons = std::move(addons); }
+
+        // Deferred transport reattach (AC WorldSession.h, same field names; "pending" == entry != 0)
+        struct PendingTransportAttach
+        {
+            uint32 entry   = 0;
+            uint32 mapId   = 0;
+            float  offsetX = 0.f;
+            float  offsetY = 0.f;
+            float  offsetZ = 0.f;
+            float  offsetO = 0.f;
+        };
+        bool HasPendingTransportAttach() const { return _pendingTransportAttach.entry != 0; }
+        PendingTransportAttach const& GetPendingTransportAttach() const { return _pendingTransportAttach; }
+        void SetPendingTransportAttach(PendingTransportAttach const& pa) { _pendingTransportAttach = pa; }
+        void ClearPendingTransportAttach() { _pendingTransportAttach = {}; }
+        // Deferred pet transfer: held by shared_ptr (type-erased deleter works with the incomplete
+        // TransferPetInfo until PlayerTransfer.h exists; a unique_ptr would not compile in ~WorldSession).
+        // A unique_ptr<TransferPetInfo> argument converts implicitly at call sites that see the full type.
+        TransferPetInfo const* GetPendingPetTransfer() const { return _pendingPetTransfer.get(); }
+        void SetPendingPetTransfer(std::shared_ptr<TransferPetInfo> p) { _pendingPetTransfer = std::move(p); }
+        void ClearPendingPetTransfer() { _pendingPetTransfer.reset(); }
 
         /// Session in auth.queue currently
         void SetInQueue(bool state) { m_inQueue = state; }
@@ -1314,6 +1361,13 @@ class TC_GAME_API WorldSession
         Player* _player;
         std::shared_ptr<WorldSocket> m_Socket;
         std::string m_Address;                              // Current Remote Address
+        SessionKey _clusterSessionKey{};
+        std::array<uint8, 4> _clusterAuthSeed{};
+        uint64 _redirectAutoLoginGuid = 0;
+        bool _redirectedOut = false;
+        bool m_redirectPending = false;
+        PendingTransportAttach _pendingTransportAttach{};
+        std::shared_ptr<TransferPetInfo> _pendingPetTransfer;
      // std::string m_LAddress;                             // Last Attempted Remote Adress - we can not set attempted ip for a non-existing session!
 
         AccountTypes _security;
@@ -1340,13 +1394,7 @@ class TC_GAME_API WorldSession
 
         std::unordered_map<uint32 /*instanceId*/, SystemTimePoint/*releaseTime*/> _instanceResetTimes;
 
-        struct Addons
-        {
-            static uint32 constexpr MaxSecureAddons = 25;
-
-            std::vector<SecureAddonInfo> SecureAddons;
-            uint32 LastBannedAddOnTimestamp = 0;
-        } _addons;
+        Addons _addons;
         uint32 recruiterId;
         bool isRecruiter;
         LockedQueue<WorldPacket*> _recvQueue;

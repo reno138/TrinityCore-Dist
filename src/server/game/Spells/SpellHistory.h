@@ -138,6 +138,7 @@ public:
 
     static void GetCooldownDurations(SpellInfo const* spellInfo, uint32 itemId, int32* cooldown, uint32* categoryId, int32* categoryCooldown);
 
+    CooldownStorageType const& GetCooldowns() const { return _spellCooldowns; }
     CooldownStorageType::size_type GetCooldownsSizeForPacket() const { return _spellCooldowns.size(); }
     void SaveCooldownStateBeforeDuel();
     void RestoreCooldownStateAfterDuel();

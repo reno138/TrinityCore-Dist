@@ -2173,6 +2173,7 @@ void World::SetInitialWorldSettings()
     m_timers[WUPDATE_CHECK_FILECHANGES].SetInterval(500);
 
     m_timers[WUPDATE_WHO_LIST].SetInterval(getIntConfig(CONFIG_WHO_LIST_UPDATE_INTERVAL) * IN_MILLISECONDS); // update who list cache every 5 seconds
+    m_timers[WUPDATE_CLUSTER].SetInterval(5 * IN_MILLISECONDS);
 
     m_timers[WUPDATE_CHANNEL_SAVE].SetInterval(getIntConfig(CONFIG_PRESERVE_CUSTOM_CHANNEL_INTERVAL) * MINUTE * IN_MILLISECONDS);
 
@@ -3091,6 +3092,13 @@ uint32 World::ShutdownCancel()
     return oldTimer;
 }
 
+void World::ProcessPendingCallbacks()
+{
+    std::function<void()> cb;
+    while (_callbackQueue.next(cb))
+        cb();
+}
+
 /// Send a server message to the user(s)
 void World::SendServerMessage(ServerMessageType messageID, std::string stringParam /*= ""*/, Player* player /*= nullptr*/)
 {
@@ -3504,6 +3512,12 @@ void World::LoadDBVersion()
 
     if (m_DBVersion.empty())
         m_DBVersion = "Unknown world database.";
+}
+
+void World::QueuePlayerDeactivation(uint64 guid)
+{
+    std::lock_guard<std::mutex> lock(_deactivateQueueMutex);
+    _playerDeactivateQueue.push_back(guid);
 }
 
 void World::UpdateAreaDependentAuras()

@@ -31,9 +31,12 @@
 #include "Timer.h"
 
 #include <atomic>
+#include <functional>
 #include <list>
 #include <map>
+#include <mutex>
 #include <unordered_map>
+#include <vector>
 
 class Player;
 class WorldPacket;
@@ -82,6 +85,7 @@ enum WorldTimers
     WUPDATE_CHECK_FILECHANGES,
     WUPDATE_WHO_LIST,
     WUPDATE_CHANNEL_SAVE,
+    WUPDATE_CLUSTER,
     WUPDATE_COUNT
 };
 
@@ -750,6 +754,9 @@ class TC_GAME_API World
 
         void ProcessCliCommands();
         void QueueCliCommand(CliCommandHolder* commandHolder) { cliCmdQueue.add(commandHolder); }
+        void ProcessPendingCallbacks();
+        void QueueCallback(std::function<void()> cb) { _callbackQueue.add(std::move(cb)); }
+        void QueuePlayerDeactivation(uint64 guid);
 
         void ForceGameEventUpdate();
 
@@ -850,6 +857,11 @@ class TC_GAME_API World
 
         // CLI command holder to be thread safe
         LockedQueue<CliCommandHolder*> cliCmdQueue;
+
+        // Closures posted from NATS I/O threads, drained on the world thread (cluster port)
+        LockedQueue<std::function<void()>> _callbackQueue;
+        std::mutex _deactivateQueueMutex;
+        std::vector<uint64> _playerDeactivateQueue;
 
         // scheduled reset times
         time_t m_NextDailyQuestReset;

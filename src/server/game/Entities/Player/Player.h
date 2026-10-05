@@ -1391,6 +1391,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
 
         RewardedQuestSet const& getRewardedQuests() const { return m_RewardedQuests; }
         QuestStatusMap& getQuestStatusMap() { return m_QuestStatus; }
+        QuestStatusMap const& getQuestStatusMap() const { return m_QuestStatus; }
 
         size_t GetRewardedQuestCount() const { return m_RewardedQuests.size(); }
         bool IsQuestRewarded(uint32 quest_id) const;
@@ -1563,6 +1564,9 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void SetPvP(bool state) override;
         void UpdatePvP(bool state, bool override = false);
         void UpdateZone(uint32 newZone, uint32 newArea);
+        void UpdateClusterZoneRouting(uint32 zoneId);
+        void BroadcastClusterStateIfDirty(uint32 diff);
+        void MarkClusterStateDirty(uint8 fields) { m_clusterDirtyFields |= fields; }
         void UpdateArea(uint32 newArea);
         void SetNeedsZoneUpdate(bool needsUpdate) { m_needsZoneUpdate = needsUpdate; }
 
@@ -1785,6 +1789,7 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
         void SetSkillLineId(uint32 pos, uint16 skillLineId) { SetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_ID_FIELD_OFFSET, SKILL_ID_SHORT_OFFSET, skillLineId); }
         uint16 GetSkillStepByPos(uint32 pos) const { return GetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_STEP_FIELD_OFFSET, SKILL_STEP_SHORT_OFFSET); };
         void SetSkillStep(uint32 pos, uint16 step) { SetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_STEP_FIELD_OFFSET, SKILL_STEP_SHORT_OFFSET, step); };
+        SkillStatusMap const& GetSkillStatusMap() const { return mSkillStatus; }
         uint16 GetSkillRankByPos(uint32 pos) const { return GetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_RANK_FIELD_OFFSET, SKILL_RANK_SHORT_OFFSET); }
         void SetSkillRank(uint32 pos, uint16 rank) { SetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_RANK_FIELD_OFFSET, SKILL_RANK_SHORT_OFFSET, rank); }
         uint16 GetSkillMaxRankByPos(uint32 pos) const { return GetUInt16Value(PLAYER_SKILL_INFO_1_1 + pos * 3 + SKILL_MAX_RANK_FIELD_OFFSET, SKILL_MAX_RANK_SHORT_OFFSET); }
@@ -2427,6 +2432,30 @@ class TC_GAME_API Player : public Unit, public GridObject<Player>
 
         uint32 m_zoneUpdateId;
         uint32 m_zoneUpdateTimer;
+        bool m_pendingZoneReroute{ false };
+
+        // Zone transfer hysteresis
+        uint32 m_zoneTransferDwellZone{0};     ///< zone ID being dwelled in for potential transfer
+        uint32 m_zoneTransferDwellTimer{0};    ///< ms remaining before transfer triggers
+        uint32 m_zoneTransferCooldown{ZONE_TRANSFER_COOLDOWN_MS}; ///< starts with cooldown to block transfer on initial login
+        static constexpr uint32 ZONE_TRANSFER_DWELL_MS    = 2000;  ///< 2s dwell before transfer
+        static constexpr uint32 ZONE_TRANSFER_COOLDOWN_MS = 5000;  ///< 5s cooldown after transfer
+
+        // Cluster: deferred transport reattach retry timer (ms since pending attach was stored)
+        uint32 m_transportReattachTimer{0};
+
+        // Cluster: periodic full state refresh (cold tier)
+        uint32 m_clusterFullRefreshTimer{0};
+        static constexpr uint32 CLUSTER_FULL_REFRESH_MS = 120000;  ///< 2 minutes
+
+        // Cluster shared state broadcast
+        uint32 m_clusterStateBroadcastTimer{0};  ///< ms since last state broadcast
+        uint8  m_clusterDirtyFields{0};           ///< bitmask of StateFieldMask values that changed
+        uint32 m_clusterLastHealth{0};
+        uint32 m_clusterLastPower{0};
+        bool   m_clusterLastCombat{false};
+        bool   m_clusterLastDead{false};
+        static constexpr uint32 CLUSTER_STATE_BROADCAST_INTERVAL = 100; ///< broadcast every 100ms (10Hz)
         uint32 m_areaUpdateId;
 
         uint32 m_deathTimer;

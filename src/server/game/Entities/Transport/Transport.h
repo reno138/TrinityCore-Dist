@@ -82,6 +82,8 @@ class TC_GAME_API Transport : public GameObject, public TransportBase
         uint32 GetTransportPeriod() const override { return GetUInt32Value(GAMEOBJECT_LEVEL); }
         void SetPeriod(uint32 period) { SetLevel(period); }
         uint32 GetTimer() const { return GetGOValue()->Transport.PathProgress; }
+        uint32 GetPathProgress() const { return GetGOValue()->Transport.PathProgress; }
+        void SetPathProgress(uint32 v) { m_goValue.Transport.PathProgress = v; }
 
         KeyFrameVec const& GetKeyFrames() const { return _transportInfo->keyFrames; }
 
@@ -100,6 +102,8 @@ class TC_GAME_API Transport : public GameObject, public TransportBase
         TransportTemplate const* GetTransportTemplate() const { return _transportInfo; }
 
         std::string GetDebugInfo() const override;
+
+        void InitializeToTime(uint32 timer);
 
     private:
         void MoveToNextWaypoint();
