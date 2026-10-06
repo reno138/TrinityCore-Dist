@@ -730,6 +730,14 @@ void World::LoadConfigSettings(bool reload)
         TC_LOG_ERROR("server.loading", "InstanceMapLoadAllGrids enabled, but GridUnload also enabled. GridUnload must be disabled to enable instance map pre-loading. Instance map pre-loading disabled");
         m_bool_configs[CONFIG_INSTANCEMAP_LOAD_GRIDS] = false;
     }
+    // Cluster: same rule for instanced maps — every grid of an instance is loaded when the
+    // instance is created, so a cross-node arrival never lands in a cold grid.
+    if (sClusterMgr.IsEnabled())
+    {
+        if (!m_bool_configs[CONFIG_INSTANCEMAP_LOAD_GRIDS])
+            TC_LOG_INFO("server.loading", "Cluster mode: forcing InstanceMapLoadAllGrids = 1 (conf value ignored)");
+        m_bool_configs[CONFIG_INSTANCEMAP_LOAD_GRIDS] = true;
+    }
     m_int_configs[CONFIG_INTERVAL_SAVE] = sConfigMgr->GetIntDefault("PlayerSaveInterval", 15 * MINUTE * IN_MILLISECONDS);
     m_int_configs[CONFIG_INTERVAL_DISCONNECT_TOLERANCE] = sConfigMgr->GetIntDefault("DisconnectToleranceInterval", 0);
     m_bool_configs[CONFIG_STATS_SAVE_ONLY_ON_LOGOUT] = sConfigMgr->GetBoolDefault("PlayerSave.Stats.SaveOnlyOnLogout", true);
