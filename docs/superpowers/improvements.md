@@ -33,7 +33,7 @@ One entry per item: what, why, cost, risk. Reviewed at each phase boundary. Noth
 24. **CLI:** non-tty `std::getline` blocks shutdown when stdin is a held-open pipe (matters for the phase 3 supervisor); interactive Ctrl-D now stops the server (AC semantics, differs from upstream).
 25. **Unguarded `CreateBaseMap` dereferences** remain in `OutdoorPvP.cpp:661` and `Transport.cpp:706`; only reachable for continents in legacy `InstanceServer.Enable` mode.
 26. **Double `BroadcastPlayerTransferFull`** on cache-activate login and in `LearnTalent` (via `LearnSpell`); a burst on spell-chain relearn.
-27. **Zone-scoped spawning with a single ownership predicate** (from the original register): a zone node must also load its zones' maps; proper fix = a player belongs on node N iff N owns the zone, or nobody claims the zone and N owns the map.
+27. **Zone-scoped spawning with a single ownership predicate** — now also the way to drop the full-continent preload a zone node needs today (cluster nodes must run `GridUnload = 0` + `BaseMapLoadAllGrids = 1`: on-demand grid loading caused arrival hangs and a crash window between stale-copy deactivation and the new arrival in the same grid, 2026-10-05). (from the original register): a zone node must also load its zones' maps; proper fix = a player belongs on node N iff N owns the zone, or nobody claims the zone and N owns the map.
 28. **Verify the client's 20-byte redirect proof** at the destination (original register item).
 29. **Split NatsBus** (3,350 lines) after phase 2 lands.
 30. **Non-owned instanceable map lookups are never cached** (`GetAreaId/GetZoneId` on such maps take the maps lock and log DEBUG every call).
