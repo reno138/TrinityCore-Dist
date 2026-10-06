@@ -72,8 +72,9 @@ not ported yet (phase 3).
 
 ### 1. Requirements
 
-- **Linux x86_64.** Developed on Ubuntu 26.04 with GCC 15. Everything
-  TrinityCore 3.3.5 needs ([upstream requirements](https://trinitycore.info/en/install/requirements)):
+- **Linux x86_64 or Windows x64.** Developed on Ubuntu 26.04 with GCC 15;
+  also builds with Clang 21 and with Visual Studio 2026 (MSVC 14.51).
+  Everything TrinityCore 3.3.5 needs ([upstream requirements](https://trinitycore.info/en/install/requirements)):
   CMake ≥ 3.18, Boost ≥ 1.74, OpenSSL, readline, zlib, bzip2, and the
   **MariaDB or MySQL client library**.
 - **A MySQL or MariaDB server** that every node can reach.
@@ -102,6 +103,26 @@ then `vmap4assembler`, `mmaps_generator`). Every node needs the same set.
 
 `contrib/cluster/vm-sync-build.sh` is the helper used during development to
 sync a checkout to a build host and build there; adapt or ignore it.
+
+**Windows.** Install Visual Studio 2026 (or 2022) with the C++ desktop
+workload, the Boost prebuilt binaries for MSVC 14.3, OpenSSL Win64 and a
+MariaDB or MySQL install for the client library, then:
+
+```powershell
+cmake -S TrinityCore-Dist -B build -G "Visual Studio 18 2026" -A x64 `
+      -DBOOST_ROOT=C:\local\boost_1_87_0 -DBoost_COMPILER=-vc143 `
+      -DOPENSSL_ROOT_DIR="C:\Program Files\OpenSSL-Win64" `
+      -DMYSQL_INCLUDE_DIR="C:\Program Files\MariaDB 13.0\include\mysql" `
+      -DMYSQL_LIBRARY="C:\Program Files\MariaDB 13.0\lib\libmariadb.lib" `
+      -DTOOLS=1 -DSERVERS=1 -DSCRIPTS=static -DCMAKE_INSTALL_PREFIX=C:\tc-335
+cmake --build build --config RelWithDebInfo --parallel
+cmake --install build --config RelWithDebInfo
+```
+
+The install step puts the executables directly in the prefix. As with stock
+TrinityCore, copy `libmariadb.dll` and the OpenSSL `libcrypto`/`libssl` DLLs
+next to them. `-DBoost_COMPILER=-vc143` lets a newer MSVC toolset link the
+vc143 Boost binaries; the toolsets are ABI-compatible.
 
 ### 3. Databases
 
