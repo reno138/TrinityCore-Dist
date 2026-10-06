@@ -17,6 +17,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <ws2tcpip.h>   // inet_pton
 #else
 #include <arpa/inet.h>
 #endif

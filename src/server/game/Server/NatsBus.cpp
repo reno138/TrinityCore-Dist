@@ -21,10 +21,8 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 #include "ArenaTeam.h"
+#include "Util.h"
 #include "ArenaTeamMgr.h"
 #include "Battleground.h"
 #include "BattlegroundMgr.h"
@@ -1759,11 +1757,7 @@ void NatsBus::SendMgmtStatus()
     // Collect metrics.
     uint32 playerCount = static_cast<uint32>(sWorld->GetPlayerCount());
     uint32 maxPlayers  = static_cast<uint32>(sWorld->GetPlayerAmountLimit());
-#ifndef _WIN32
-    uint32 pid         = static_cast<uint32>(::getpid());
-#else
-    uint32 pid         = 0;
-#endif
+    uint32 pid         = GetPID();
     uint32 uptimeSecs  = (getMSTime() - _startupTimeMs) / 1000u;
     uint32 memUsageMB  = ReadMemUsageMB();
     uint8  cpuPercent  = ComputeCpuPercent(_lastCpuJiffies, _lastCpuCheckMs);

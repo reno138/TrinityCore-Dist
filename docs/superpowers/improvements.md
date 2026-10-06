@@ -37,6 +37,14 @@ One entry per item: what, why, cost, risk. Reviewed at each phase boundary. Noth
 28. **Verify the client's 20-byte redirect proof** at the destination (original register item).
 29. **Split NatsBus** (3,350 lines) after phase 2 lands.
 30. **Non-owned instanceable map lookups are never cached** (`GetAreaId/GetZoneId` on such maps take the maps lock and log DEBUG every call).
+31. **`memset` over `std::vector` in `ClusterMgr::DrainInviteResults`** (`ClusterMgr.cpp:591`, carried from c9core). A "corruption recovery" hack: if `_inviteResults` looks corrupted it zeroes the vector object instead of destroying it. Undefined behaviour (clang 21 flags it with `-Wnontrivial-memcall`), leaks the buffer, and papers over the NATS use-after-free it was written for. Phase 2 path (cross-node invites). Proper fix: root-cause the UAF, delete the check. Same in AC.
+
+## Compiler / platform status (2026-10-05)
+
+- **GCC 15 (Ubuntu 26.04):** the lab build. Clean.
+- **Clang 21.1 (same host, libstdc++ 15):** full tree builds, 0 errors, 1 warning (item 31). Needs `--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/15` on that host because clang picks the empty gcc-16 directory.
+- **Upstream GitHub matrix (ubuntu-24.04 gcc-13 / clang-17, macOS, Windows VS2022):** failed on every cell on the first push; logs lost when the workflows were removed. Treat "builds on older toolchains" as unverified.
+- **Windows:** `_WIN32` branches exist in `ClusterMgr.cpp`, `ClientRedirect.cpp` (needs `<ws2tcpip.h>` for `inet_pton`, added), `NatsBus.cpp` (now `GetPID()`). `dep/cnats` supports MSVC. First real Windows build pending on wow-win-01 (VM 174).
 
 ## Backport list to c9core (AzerothCore)
 Items 3, 4, 5, 6, 7, 8 (InstanceSaveMgr/cs_go part), and the audit findings 12–16, 18, 20.
