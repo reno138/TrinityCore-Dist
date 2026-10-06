@@ -48,6 +48,19 @@ if(SERVERS)
   add_subdirectory(cnats EXCLUDE_FROM_ALL)
   set(BUILD_TESTING "${_tc_saved_build_testing}")
   if(TARGET nats_static)
+    # nats.c exports its whole src/ tree as the public include directory, and that tree
+    # also holds hash.h, timer.h and util.h. On a case-insensitive filesystem (Windows,
+    # macOS) those shadow TrinityCore's Hash.h, Timer.h and Util.h for every consumer of
+    # nats_static. Export only the public headers: nats.h plus the status.h/version.h it
+    # includes (version.h is generated into cnats/src by cnats' own configure step).
+    set(_cnats_public "${CMAKE_CURRENT_BINARY_DIR}/cnats-public")
+    file(MAKE_DIRECTORY "${_cnats_public}")
+    foreach(_h nats.h status.h version.h)
+      configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cnats/src/${_h}" "${_cnats_public}/${_h}" COPYONLY)
+    endforeach()
+    # cnats carries install(EXPORT) rules, so a build-tree path must stay behind BUILD_INTERFACE.
+    set_target_properties(nats_static PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+      "$<BUILD_INTERFACE:${_cnats_public}>;$<INSTALL_INTERFACE:include>")
     # nats.c forces -std=c99 but uses C11 _Generic; the later flag wins.
     if(NOT MSVC)
       target_compile_options(nats_static PRIVATE -std=c11)
