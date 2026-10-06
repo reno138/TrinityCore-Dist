@@ -712,6 +712,18 @@ void World::LoadConfigSettings(bool reload)
         TC_LOG_ERROR("server.loading", "BaseMapLoadAllGrids enabled, but GridUnload also enabled. GridUnload must be disabled to enable base map pre-loading. Base map pre-loading disabled");
         m_bool_configs[CONFIG_BASEMAP_LOAD_GRIDS] = false;
     }
+    // Cluster: a redirect arrival drops a player straight into a grid with no approach, and the
+    // destination may be tearing down its stale copy of that player from the same grid at that
+    // moment. On-demand grid loading caused multi-second arrival hangs and a crash in that
+    // window (2026-10-05). Cluster nodes therefore always preload every grid of their maps and
+    // never unload; the two conf keys are ignored when ClusterServer.NodeId > 0.
+    if (sClusterMgr.IsEnabled())
+    {
+        if (!m_bool_configs[CONFIG_BASEMAP_LOAD_GRIDS] || m_bool_configs[CONFIG_GRID_UNLOAD])
+            TC_LOG_INFO("server.loading", "Cluster mode: forcing BaseMapLoadAllGrids = 1 and GridUnload = 0 (conf values ignored)");
+        m_bool_configs[CONFIG_BASEMAP_LOAD_GRIDS] = true;
+        m_bool_configs[CONFIG_GRID_UNLOAD] = false;
+    }
     m_bool_configs[CONFIG_INSTANCEMAP_LOAD_GRIDS] = sConfigMgr->GetBoolDefault("InstanceMapLoadAllGrids", false);
     if (m_bool_configs[CONFIG_INSTANCEMAP_LOAD_GRIDS] && m_bool_configs[CONFIG_GRID_UNLOAD])
     {

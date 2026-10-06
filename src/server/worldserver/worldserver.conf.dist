@@ -4228,6 +4228,11 @@ InstanceServer.Port = 8087
 # and a reachable NatsURL. Set ClusterServer.Maps = "" and run a single node
 # for "standalone" behavior (one node owns all maps).
 #
+#    NOTE: when ClusterServer.NodeId > 0 the worldserver forces BaseMapLoadAllGrids = 1 and
+#          GridUnload = 0 (every grid of the node's maps is preloaded and never unloaded); the
+#          two keys above in GRID SETTINGS are ignored on cluster nodes. Budget 2-3 GB RAM
+#          per continent for it.
+#
 #    ClusterServer.NodeId
 #        Description: Unique integer ID for this node within the cluster. Must be distinct
 #                     across all worldserver instances. Typically 1–8.
