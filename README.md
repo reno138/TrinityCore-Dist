@@ -255,8 +255,13 @@ logging are unchanged; the cluster code lives in `src/server/game/Server/`
 `src/server/shared/Cluster/`, plus hooks in the login, socket, session,
 player, map, transport and world code.
 
-Upstream TrinityCore commits are untouched, so merging a newer `3.3.5` is a
-plain `git merge`.
+Upstream TrinityCore history is carried in full, with one mechanical change:
+GitHub rejects packs containing a handful of malformed author/committer
+idents from 2008-era upstream commits, so those idents were rewritten (stray
+`<` and `>` stripped). The commit SHAs here therefore differ from
+`TrinityCore/TrinityCore`, and a newer `3.3.5` cannot be merged into this
+history directly. New upstream work is merged into the private tracking clone
+and rebased onto this `main`.
 
 ## License
 
