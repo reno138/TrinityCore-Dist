@@ -7292,6 +7292,16 @@ void Player::UpdateArea(uint32 newArea)
 
 void Player::UpdateClusterZoneRouting(uint32 zoneId)
 {
+    // TC: Map::RemovePlayerFromMap calls UpdateZone(MAP_INVALID_ZONE, 0) to settle the
+    // per-zone player counts before a player leaves the map. That marker is not a zone;
+    // on a zone node it would read as "non-local" and arm a dwell for 0xFFFFFFFF.
+    if (zoneId == MAP_INVALID_ZONE)
+    {
+        m_zoneTransferDwellZone = 0;
+        m_zoneTransferDwellTimer = 0;
+        return;
+    }
+
     // Cluster: zone-based transfer with hysteresis (dwell timer + cooldown)
     // Start the dwell timer when entering a non-local zone. The cooldown check
     // is done when the dwell EXPIRES (in Player::Update), not here — because
