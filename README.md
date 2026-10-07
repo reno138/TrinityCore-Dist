@@ -104,9 +104,14 @@ then `vmap4assembler`, `mmaps_generator`). Every node needs the same set.
 `contrib/cluster/vm-sync-build.sh` is the helper used during development to
 sync a checkout to a build host and build there; adapt or ignore it.
 
-**Windows.** Install Visual Studio 2026 (or 2022) with the C++ desktop
-workload, the Boost prebuilt binaries for MSVC 14.3, OpenSSL Win64 and a
-MariaDB or MySQL install for the client library, then:
+**Windows.** The build is CMake on Windows too; there is no checked-in
+Visual Studio project. CMake generates the solution (`TrinityCore.slnx` with
+VS 2026, `.sln` with VS 2022) and all `.vcxproj` files into the build
+directory, including a `nats_static` project for the vendored NATS client, so
+building the solution or `ALL_BUILD` builds everything in one go. Install
+Visual Studio 2026 (or 2022) with the C++ desktop workload, the Boost
+prebuilt binaries for MSVC 14.3, OpenSSL Win64 and a MariaDB or MySQL install
+for the client library, then:
 
 ```powershell
 cmake -S TrinityCore-Dist -B build -G "Visual Studio 18 2026" -A x64 `
@@ -122,7 +127,11 @@ cmake --install build --config RelWithDebInfo
 The install step puts the executables directly in the prefix. As with stock
 TrinityCore, copy `libmariadb.dll` and the OpenSSL `libcrypto`/`libssl` DLLs
 next to them. `-DBoost_COMPILER=-vc143` lets a newer MSVC toolset link the
-vc143 Boost binaries; the toolsets are ABI-compatible.
+vc143 Boost binaries; the toolsets are ABI-compatible. To work in the IDE,
+open the generated solution from the build directory, or open the source
+folder with Visual Studio's CMake support. `worldserver -s install` and
+`authserver -s install` register them as Windows services, as in stock
+TrinityCore.
 
 ### 3. Databases
 
